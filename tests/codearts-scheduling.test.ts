@@ -22,7 +22,7 @@ const end = `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "sto
 const completion = () => new Response(delta("OK") + end, { headers: { "content-type": "text/event-stream" } })
 
 async function setup(t: any, count = 2, config: Record<string, string> = {}, options: any = {}) {
-  for (const [name, value] of Object.entries(config)) vi.stubEnv(name, value)
+  for (const [name, value] of Object.entries({ CODEARTS_SESSION_TTL_MS: "0", ...config })) vi.stubEnv(name, value)
   const app = await startTestApp(options)
   t.onTestFinished(async () => {
     await app.close()
@@ -138,9 +138,58 @@ test("默认 HTTP 并发：20 个请求在两账号上运行，每号最大在�
   assert.equal(env.app.host.codeartsScheduling.stats().queued, 0)
 })
 
+test("流结束仍保留会话占位，后续请求预先换号，满池时不再发送上游", async (t) => {
+  const env = await setup(t, 2, {
+    CODEARTS_SESSION_LIMIT: "1",
+    CODEARTS_SESSION_TTL_MS: "60000",
+    CODEARTS_QUEUE_LIMIT: "0",
+  })
+  for (let index = 0; index < 2; index++) {
+    const response = await env.send("same-session")
+    assert.equal(response.status, 200, JSON.stringify(await response.json()))
+  }
+  assert.notEqual(env.calls[0].account, env.calls[1].account)
+  assert.equal(env.app.host.codeartsScheduling.stats().retainedSessions, 2)
+  assert.equal(env.app.host.codeartsScheduling.stats().inFlight, 0)
+  const full = await env.send("third")
+  assert.equal(full.status, 429)
+  await full.json()
+  assert.equal(env.calls.length, 2)
+})
+
+for (const kind of ["HTTP", "SSE"]) {
+  test(`${kind} 并发上限避让整号，不写模型限流且其他模型也不再撞号`, async (t) => {
+    const env = await setup(t)
+    env.setAnswer(async () => {
+      if (env.calls.length > 1) return completion()
+      return kind === "HTTP"
+        ? Response.json({ error_code: "TM.00001041" }, { status: 400 })
+        : new Response('data: {"error_code":"TM.00001041","error_msg":"busy"}\n\n', {
+            headers: { "content-type": "text/event-stream" },
+          })
+    })
+    const response = await env.send("limited")
+    assert.equal(response.status, 200, JSON.stringify(await response.json()))
+    const other = await env.send("other", { model: "codearts/glm-5.3-flash" })
+    assert.equal(other.status, 200, JSON.stringify(await other.json()))
+    assert.equal(env.calls[1].account, env.calls[2].account)
+    assert.notEqual(env.calls[0].account, env.calls[2].account)
+    assert.equal(env.app.host.codeartsScheduling.stats().accountBackoffs, 1)
+    const pool = env.app.host.ctx.get("accountPool")
+    assert.ok(
+      pool
+        .getStateSnapshot()
+        .accounts.filter((a: any) => a.provider === "codearts")
+        .every((a: any) => !a.modelRateLimits?.[MODEL]),
+    )
+  })
+}
+
 test("流式输出期间继续占用名额；排队取消与生成取消都回收名额", async (t) => {
   const env = await setup(t, 1, {
     CODEARTS_MAX_IN_FLIGHT: "1",
+    CODEARTS_SESSION_LIMIT: "1",
+    CODEARTS_SESSION_TTL_MS: "60000",
     CODEARTS_QUEUE_LIMIT: "1",
     CODEARTS_QUEUE_TIMEOUT_MS: "1000",
   })
@@ -185,6 +234,7 @@ test("流式输出期间继续占用名额；排队取消与生成取消都回�
   await vi.waitFor(() => assert.equal(env.app.host.codeartsScheduling.stats().inFlight, 0))
   assert.equal(upstreamAborted, true)
   assert.equal(env.calls.length, 1)
+  assert.equal(env.app.host.codeartsScheduling.stats().retainedSessions, 1)
 })
 
 for (const cancel of [false, true]) {
@@ -309,7 +359,7 @@ for (const kind of ["SSE", "HTTP"]) {
     assert.equal(env.calls.length, 2)
     assert.notEqual(env.calls[0].account, env.calls[1].account)
     const pool = env.app.host.ctx.get("accountPool")
-    assert.equal(pool.candidateAccounts("codearts", MODEL, new Set()).length, 1)
+    assert.equal(pool.candidateAccounts("codearts", MODEL, new Set()).length, kind === "SSE" ? 1 : 2)
     assert.equal(pool.candidateAccounts("codearts", "other-model", new Set()).length, 2)
     assert.equal(env.app.host.codeartsScheduling.stats().inFlight, 0)
     const later = await env.send("queued")
@@ -361,7 +411,7 @@ test("真实 400 TM.00001041 即使队列报告 working 也立即换号", async 
 })
 
 test("普通 400 参数错误保留上游处理，不换号、不惩罚账号", async (t) => {
-  const env = await setup(t)
+  const env = await setup(t, 2, { CODEARTS_SESSION_LIMIT: "1", CODEARTS_SESSION_TTL_MS: "60000" })
   env.setAnswer(async (url) =>
     url.includes("/queue/status")
       ? Response.json({ status: "working", queue_position: 0 })
@@ -372,6 +422,11 @@ test("普通 400 参数错误保留上游处理，不换号、不惩罚账号", 
   assert.equal((await response.json()).error.code, "INVALID_REQUEST")
   assert.equal(env.calls.length, 1)
   assert.equal(env.app.host.ctx.get("accountPool").candidateAccounts("codearts", MODEL, new Set()).length, 2)
+  assert.equal(env.app.host.codeartsScheduling.stats().retainedSessions, 0)
+  env.setAnswer(async () => completion())
+  const next = await env.send("after-invalid")
+  assert.equal(next.status, 200, JSON.stringify(await next.json()))
+  assert.equal(env.app.host.codeartsScheduling.stats().retainedSessions, 1)
 })
 
 for (const code of ["InferHub.ModelArts.81111.429", "InferHub.4291.200"]) {

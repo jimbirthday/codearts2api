@@ -2,6 +2,8 @@ import { LlmError } from "@deepseek-ai/dsh-llm"
 
 export interface SchedulingConfig {
   maxInFlight: number
+  sessionLimit: number
+  sessionTtlMs: number
   queueLimit: number
   queueTimeoutMs: number
   stickyTtlMs: number
@@ -35,7 +37,15 @@ export function createAccountScheduler({
   resolve: (entry: any) => Promise<any>
   config: SchedulingConfig
 }) {
-  const loads = new Map<string, { inFlight: number; lastUsed: number }>()
+  const loads = new Map<
+    string,
+    {
+      inFlight: number
+      lastUsed: number
+      sessions: Set<{ accepted: boolean; expiresAt: number; retainUntil: number }>
+      blockedUntil: number
+    }
+  >()
   const bindings = new Map<string, Binding>()
   const boundCounts = new Map<string, number>()
   const waiting = new Set<{ selection: Selection; ready: (slot: any) => void; fail: (error: unknown) => void }>()
@@ -44,6 +54,16 @@ export function createAccountScheduler({
   let pumping = false
   const busy = () =>
     new LlmError("CodeArts 账号繁忙，等待名额超时或队列已满，请稍后重试", "RATE_LIMIT", { status: 429 })
+
+  function sessionFull(id: string) {
+    const load = loads.get(id)
+    if (!load) return false
+    const now = Date.now()
+    for (const session of load.sessions) if (session.expiresAt <= now) load.sessions.delete(session)
+    return load.blockedUntil > now || (config.sessionTtlMs > 0 && load.sessions.size >= config.sessionLimit)
+  }
+
+  const free = (id: string) => !sessionFull(id) && (loads.get(id)?.inFlight ?? 0) < config.maxInFlight
 
   function unbind(key: string, expected: Binding) {
     if (bindings.get(key) !== expected) return
@@ -66,7 +86,9 @@ export function createAccountScheduler({
       if (binding.active === 0 && binding.expiresAt <= now) unbind(key, binding)
     }
     for (const [id, load] of loads) {
-      if (load.inFlight === 0 && !boundCounts.has(id)) loads.delete(id)
+      sessionFull(id)
+      if (load.inFlight === 0 && !load.sessions.size && load.blockedUntil <= now && !boundCounts.has(id))
+        loads.delete(id)
     }
   }
 
@@ -87,14 +109,14 @@ export function createAccountScheduler({
       throw new LlmError("当前模型没有可用的 CodeArts 账号，请检查账号启用状态、凭据和模型限额", "MISSING_CREDENTIAL", {
         status: 503,
       })
+    if (available.every((entry) => (loads.get(entry.id)?.blockedUntil ?? 0) > Date.now()))
+      throw new LlmError("CodeArts 候选账号的会话名额均已满，请稍后重试", "QUEUE", { status: 429 })
 
     if (
       binding &&
-      (loads.get(binding.accountId)?.inFlight ?? 0) >= config.maxInFlight &&
-      Date.now() >= (selection.preferUntil ?? Infinity) &&
-      available.some(
-        (entry) => entry.id !== binding!.accountId && (loads.get(entry.id)?.inFlight ?? 0) < config.maxInFlight,
-      )
+      !free(binding.accountId) &&
+      (sessionFull(binding.accountId) || Date.now() >= (selection.preferUntil ?? Infinity)) &&
+      available.some((entry) => entry.id !== binding!.accountId && free(entry.id))
     ) {
       unbind(key!, binding)
       binding = undefined
@@ -104,14 +126,19 @@ export function createAccountScheduler({
     let picked: any
     for (const entry of eligible) {
       const load = loads.get(entry.id)
-      if ((load?.inFlight ?? 0) >= config.maxInFlight) continue
+      if (!free(entry.id)) continue
       if (!picked) {
         picked = entry
         continue
       }
-      const left = [load?.inFlight ?? 0, boundCounts.get(entry.id) ?? 0, load?.lastUsed ?? 0]
+      const left = [load?.inFlight ?? 0, load?.sessions.size ?? 0, boundCounts.get(entry.id) ?? 0, load?.lastUsed ?? 0]
       const rightLoad = loads.get(picked.id)
-      const right = [rightLoad?.inFlight ?? 0, boundCounts.get(picked.id) ?? 0, rightLoad?.lastUsed ?? 0]
+      const right = [
+        rightLoad?.inFlight ?? 0,
+        rightLoad?.sessions.size ?? 0,
+        boundCounts.get(picked.id) ?? 0,
+        rightLoad?.lastUsed ?? 0,
+      ]
       const difference = left.findIndex((value, index) => value !== right[index])
       if (difference !== -1 && left[difference] < right[difference]) picked = entry
     }
@@ -134,7 +161,9 @@ export function createAccountScheduler({
       binding.active++
       touch(key!, binding)
     }
-    const load = loads.get(picked.id) ?? { inFlight: 0, lastUsed: 0 }
+    const load = loads.get(picked.id) ?? { inFlight: 0, lastUsed: 0, sessions: new Set(), blockedUntil: 0 }
+    const session = { accepted: false, expiresAt: Infinity, retainUntil: 0 }
+    load.sessions.add(session)
     // 检查与占用之间不 await，避免多个并发请求争抢同一个剩余名额。
     load.inFlight++
     load.lastUsed = ++sequence
@@ -142,10 +171,23 @@ export function createAccountScheduler({
     let released = false
     return {
       entry: picked,
+      acceptSession() {
+        if (!session.accepted) session.retainUntil = Date.now() + config.sessionTtlMs
+        session.accepted = true
+      },
+      rejectSession() {
+        session.accepted = false
+      },
       release(reason: ReleaseReason = "cancel") {
         if (released) return
         released = true
         load.inFlight--
+        // 实测名额至少保留到发出后约 60 秒，长流完成后无需再加完整窗口。
+        if (session.accepted && config.sessionTtlMs > 0) {
+          session.expiresAt =
+            reason === "success" ? session.retainUntil : Math.max(session.retainUntil, Date.now() + config.sessionTtlMs)
+          if (session.expiresAt <= Date.now()) load.sessions.delete(session)
+        } else load.sessions.delete(session)
         if (binding) {
           binding.active--
           if (reason === "failure") unbind(key!, binding)
@@ -183,6 +225,25 @@ export function createAccountScheduler({
     if (waiting.size >= config.queueLimit) throw busy()
     const waitMs = Math.min(config.queueTimeoutMs, (selection.queueDeadline ?? Infinity) - Date.now())
     if (waitMs <= 0) throw busy()
+    const available = candidates(selection.model, selection.excluded)
+    if (
+      available.length &&
+      available.every((entry) => (loads.get(entry.id)?.inFlight ?? 0) === 0 && sessionFull(entry.id))
+    ) {
+      const earliest = Math.min(
+        ...available.map((entry) => {
+          const load = loads.get(entry.id)!
+          const expiry = [...load.sessions].map((session) => session.expiresAt).sort((a, b) => a - b)
+          return Math.max(load.blockedUntil, expiry[expiry.length - config.sessionLimit] ?? 0)
+        }),
+      )
+      if (earliest > Date.now() + waitMs)
+        throw new LlmError(
+          `CodeArts 会话名额尚未释放，预计 ${Math.ceil((earliest - Date.now()) / 1000)} 秒后可重试`,
+          "RATE_LIMIT",
+          { status: 429 },
+        )
+    }
     return new Promise((ready, fail) => {
       const finish = (error: unknown, reserved?: any) => {
         if (!waiting.delete(ticket)) return
@@ -232,12 +293,23 @@ export function createAccountScheduler({
       }
     },
     stats() {
+      prune()
       return {
         ...config,
         inFlight: [...loads.values()].reduce((sum, load) => sum + load.inFlight, 0),
         queued: waiting.size,
         bindings: bindings.size,
+        retainedSessions: [...loads.values()].reduce(
+          (sum, load) => sum + [...load.sessions].filter((s) => Number.isFinite(s.expiresAt)).length,
+          0,
+        ),
+        accountBackoffs: [...loads.values()].filter((load) => load.blockedUntil > Date.now()).length,
       }
+    },
+    blockAccount(id: string) {
+      const load = loads.get(id)
+      if (load && load.blockedUntil <= Date.now()) load.blockedUntil = Date.now() + (config.sessionTtlMs || 60_000)
+      pump()
     },
     wake: pump,
     close() {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { setImmediate as nextTick } from "node:timers/promises"
-import { test } from "vite-plus/test"
+import { test, vi } from "vite-plus/test"
 
 import { resolveCodeArtsScheduling } from "../src/config/env.ts"
 import { createAccountScheduler } from "../src/modules/scheduling/account-scheduler.ts"
@@ -11,6 +11,8 @@ function setup(t: any, config: any = {}, resolve?: (entry: any) => Promise<any>)
   const scheduler = createAccountScheduler({
     config: {
       maxInFlight: 1,
+      sessionLimit: 3,
+      sessionTtlMs: 0,
       queueLimit: 100,
       queueTimeoutMs: 1000,
       stickyTtlMs: 30_000,
@@ -186,6 +188,78 @@ test("取消首次请求不保留未成功的绑定；已有成功绑定不因�
   assert.equal(scheduler.stats().bindings, 1)
 })
 
+test("会话窗口跨模型保留至发送后到期，满窗口立即迁移粘性账号", async (t) => {
+  vi.useFakeTimers()
+  t.onTestFinished(() => vi.useRealTimers())
+  const { acquire, scheduler, entries } = setup(t, { sessionLimit: 1, sessionTtlMs: 60_000, stickyWaitMs: 10_000 })
+  const first = await acquire("sticky")
+  first.acceptSession()
+  vi.setSystemTime(Date.now() + 30_000)
+  first.release("success")
+  assert.equal(scheduler.stats().retainedSessions, 1)
+  const moved = await acquire("sticky", undefined, "other-model")
+  assert.notEqual(moved.entry.id, first.entry.id)
+  moved.release()
+  entries[1].enabled = entries[2].enabled = false
+  vi.setSystemTime(Date.now() + 30_001)
+  const restored = await acquire("sticky")
+  assert.equal(restored.entry.id, first.entry.id)
+  restored.release()
+  assert.equal(scheduler.stats().retainedSessions, 0)
+})
+
+test("超过一分钟的长流仍占用会话，成功结束后不再额外等一分钟", async (t) => {
+  vi.useFakeTimers()
+  t.onTestFinished(() => vi.useRealTimers())
+  const { acquire, scheduler, entries } = setup(t, { sessionLimit: 1, sessionTtlMs: 60_000, queueLimit: 0 })
+  entries[1].enabled = entries[2].enabled = false
+  const held = await acquire("long")
+  held.acceptSession()
+  vi.setSystemTime(Date.now() + 90_000)
+  await assert.rejects(acquire("other"), (error: any) => error.code === "RATE_LIMIT")
+  held.release("success")
+  assert.equal(scheduler.stats().retainedSessions, 0)
+  const next = await acquire("next")
+  next.release()
+})
+
+test("未发出和明确拒绝的请求回滚占位；并发上限对整号生效且不续期", async (t) => {
+  vi.useFakeTimers()
+  t.onTestFinished(() => vi.useRealTimers())
+  const { acquire, scheduler, entries } = setup(t, { sessionLimit: 1, sessionTtlMs: 60_000 })
+  entries[1].enabled = entries[2].enabled = false
+  const unsent = await acquire("unsent")
+  unsent.release("cancel")
+  const rejected = await acquire("rejected")
+  rejected.acceptSession()
+  rejected.rejectSession()
+  rejected.release("failure")
+  assert.equal(scheduler.stats().retainedSessions, 0)
+  const blocked = await acquire("blocked")
+  scheduler.blockAccount(blocked.entry.id)
+  blocked.release("failure")
+  await assert.rejects(acquire("other", undefined, "another-model"), (error: any) => error.code === "QUEUE")
+  vi.setSystemTime(Date.now() + 30_000)
+  scheduler.blockAccount(blocked.entry.id)
+  vi.setSystemTime(Date.now() + 30_001)
+  const restored = await acquire("after")
+  restored.release()
+  assert.equal(scheduler.stats().accountBackoffs, 0)
+})
+
+test("已知会话释放晚于排队预算时立即返回，避免白等 15 秒", async (t) => {
+  const { acquire, scheduler, entries } = setup(t, { sessionLimit: 1, sessionTtlMs: 60_000, queueTimeoutMs: 15_000 })
+  entries[1].enabled = entries[2].enabled = false
+  const first = await acquire("first")
+  first.acceptSession()
+  first.release("success")
+  await assert.rejects(
+    acquire("next"),
+    (error: any) => error.code === "RATE_LIMIT" && /会话名额尚未释放/.test(error.message),
+  )
+  assert.equal(scheduler.stats().queued, 0)
+})
+
 test("会话键：显式 ID 优先、按调用方隔离、兼容 Responses，历史追加保持派生键", () => {
   const headers = { authorization: "Bearer test", "x-caller-id": "one" }
   const chat = { metadata: { conversation_id: "same" }, messages: [{ role: "user", content: "hello" }] }
@@ -221,6 +295,8 @@ test("会话键：显式 ID 优先、按调用方隔离、兼容 Responses，历
 
 test("调度配置非法值直接失败，默认每号 3 个在途，显式配置优先", () => {
   assert.equal(resolveCodeArtsScheduling({}).maxInFlight, 3)
+  assert.equal(resolveCodeArtsScheduling({}).sessionLimit, 3)
+  assert.equal(resolveCodeArtsScheduling({}).sessionTtlMs, 60_000)
   assert.equal(resolveCodeArtsScheduling({ CODEARTS_MAX_IN_FLIGHT: "" }).maxInFlight, 3)
   assert.equal(resolveCodeArtsScheduling({ CODEARTS_MAX_IN_FLIGHT: "1" }).maxInFlight, 1)
   assert.equal(resolveCodeArtsScheduling({ CODEARTS_MAX_IN_FLIGHT: "2" }).maxInFlight, 2)

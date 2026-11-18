@@ -87,10 +87,10 @@ export async function installCodeArtsScheduling(ctx: any) {
       }
       return state.lease.account
     }
-    const rejectQueue = async (state: any) => {
+    const rejectQueue = async (state: any, accountConcurrency = false) => {
       if (state.lease) {
-        // 复用上游的模型限流表，避免新会话不断撞回同一个排队账号。
-        await pool.updateModelRateLimit(state.lease.entry.id, state.model, Date.now() + 60_000)
+        if (accountConcurrency) scheduler.blockAccount(state.lease.entry.id)
+        else await pool.updateModelRateLimit(state.lease.entry.id, state.model, Date.now() + 60_000)
       }
       throw queueError()
     }
@@ -103,13 +103,17 @@ export async function installCodeArtsScheduling(ctx: any) {
           headers.set("Session-Id", sessionId(state, true))
           args[1] = { ...args[1], headers }
         }
+        const chat = state && typeof args[0] === "string" && args[0].endsWith("/chat/completions")
+        // 断连或超时不能确认远端未建会话，保守保留占位；明确拒绝时才回滚。
+        if (chat) state.lease?.acceptSession()
         const response = await transport.apply(this, args)
-        if (state && [400, 403].includes(response.status)) {
+        if (chat && !response.ok) state.lease?.rejectSession()
+        if (state && !response.ok) {
           const body = await response.clone().text()
           // TM.00001041 可与 queue/status=working 同时出现，不能依赖队列状态判定。
           if (isConcurrencyLimitError(body)) {
             await response.body?.cancel().catch(() => {})
-            await rejectQueue(state)
+            await rejectQueue(state, true)
           }
         }
         return response
@@ -129,7 +133,8 @@ export async function installCodeArtsScheduling(ctx: any) {
       } catch (error: any) {
         // 由上游解析业务码；只转换其已分类的排队信号，阻止内部静默重放。
         const state = dispatch.getStore()
-        if (state && error?.name === "SseQueueRetryError") await rejectQueue(state)
+        if (state && error?.name === "SseQueueRetryError")
+          await rejectQueue(state, isConcurrencyLimitError(JSON.stringify({ error_code: error.code })))
         throw error
       }
     }

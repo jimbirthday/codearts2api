@@ -56,6 +56,8 @@ export function resolveCodeArtsScheduling(env = process.env) {
   }
   return {
     maxInFlight: integer("CODEARTS_MAX_IN_FLIGHT", 3, 1, 100),
+    sessionLimit: integer("CODEARTS_SESSION_LIMIT", 3, 1, 100),
+    sessionTtlMs: integer("CODEARTS_SESSION_TTL_MS", 60_000, 0, 600_000),
     queueLimit: integer("CODEARTS_QUEUE_LIMIT", 100, 0, 10_000),
     queueTimeoutMs: integer("CODEARTS_QUEUE_TIMEOUT_MS", 15_000, 1, 120_000),
     stickyTtlMs: integer("CODEARTS_STICKY_TTL_MS", 1_800_000, 1, 86_400_000),
