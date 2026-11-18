@@ -109,7 +109,11 @@ export async function createHttpServer(host, options: any = {}) {
     },
     logger,
   })
-  const modelsService = createModelsService({ rpc: (method, payload) => adminRpc(method, payload, "models"), logger })
+  const modelsService = createModelsService({
+    rpc: (method, payload) => adminRpc(method, payload, "models"),
+    logger,
+    clearCooldowns: host.codeartsScheduling?.clearCooldowns,
+  })
   const modelsAdmin = createModelsController({ service: modelsService })
 
   const throttle = new LoginThrottle()

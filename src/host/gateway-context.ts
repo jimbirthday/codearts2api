@@ -1,5 +1,6 @@
 import type { AsyncLocalStorage } from "node:async_hooks"
 import { subscribe, unsubscribe } from "node:diagnostics_channel"
+import type { ServerResponse } from "node:http"
 
 import { BODY_LIMIT } from "../http/body.ts"
 import { schedulingSessionKey } from "../modules/scheduling/session-key.ts"
@@ -7,6 +8,7 @@ import { schedulingSessionKey } from "../modules/scheduling/session-key.ts"
 export interface GatewayContext {
   sessionKey?: string
   started: number
+  response: ServerResponse
 }
 
 /** 在 Node 的请求入口建立异步上下文，兼容代理入口与直接访问插件网关。 */
@@ -35,6 +37,7 @@ export function installGatewayContext(storage: AsyncLocalStorage<GatewayContext>
       const context: GatewayContext = {
         sessionKey: schedulingSessionKey(undefined, request.headers),
         started: performance.now(),
+        response,
       }
       let chunks: Buffer[] = []
       let size = 0

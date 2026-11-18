@@ -50,7 +50,9 @@
 登录、签名、模型目录、推理协议与续期仍由上游实现。相关实例成员在
 `src/core/upstream.ts` 的 `assertCodeArtsSchedulingContract()` 启动核对，升级时必须跑调度集成测试。
 已分类的 SSE 排队信号（`SseQueueRetryError`）与 `queryQueueStatus()` 确认的排队会转换为
-`QUEUE`，通过上游 `updateModelRateLimit()` 冷却当前账号模型 10 秒并换号，不复制业务码解析。
+`QUEUE`，通过上游 `updateModelRateLimit()` 随机冷却当前账号模型 60–180 秒并换号，不复制业务码解析。
+`model-cooldowns.ts` 统一 CodeArts 的模型冷却，重复失败不续期，启动时收敛旧长冷却；
+批量解除走受保护的 `POST /admin/models/api/codearts/cooldowns/clear`，仍由上游账号池持久化。
 升级时同时核对 `consumeSse()`、`queryQueueStatus()`、可替换的 `fetchImpl` 与排队错误名称；输出后禁止内部重放。
 HTTP 400/403 的并发错误在传输边界交回调度，不依赖可能误报 `working` 的队列接口。
 唯一的模块路径例外是 `src/core/upstream.ts` 按插件入口相邻路径载入 `lib/llm-adapter.js` 的
@@ -62,10 +64,15 @@ HTTP 400/403 的并发错误在传输边界交回调度，不依赖可能误报 
 AsyncLocalStorage 上下文，保留上游原请求处理器和鉴权；依赖单个 `request` 监听器，契约漂移返回
 可读 503。会话正文额外解析以 `BODY_LIMIT` 为上限，超出后使用显式会话请求头。
 调度覆盖反代、直连网关和聚合到 CodeArts 的入口；内部换号也须释放旧租约、获取新租约，
-完整流结束或取消才释放当前租约。Chat-Id 按会话和账号稳定，Session-Id 按推理任务隔离。
+完整流结束或取消才释放当前租约。Chat-Id 与正文 prompt_cache_key 按会话和实际账号稳定；
+仅未签名的 Session-Id 请求头和队列查询 task_id 按推理任务隔离，换号须重新生成正文和签名。
+正文会话 ID 优先，其次含下划线的 conversation_id/session_id 等请求头，最后 prompt_cache_key；
+不能让逐轮变化的缓存键覆盖稳定的会话头。SSE 写入需 drain 时暂停拉取，等待响应断连可取消。
 
 `src/modules/scheduling/` 保存单进程的会话摘要、账号在途计数和有界等待队列，不持久化；
-多实例不共享名额。默认每号 1 个在途、队列 100、等待 15 秒、绑定空闲 30 分钟。
+多实例不共享名额。默认每号 1 个在途、队列 100、等待预算 15 秒、绑定空闲 30 分钟。
+绑定号满载时优先等 1 秒，有其他空闲号则迁移；换号不重置等待预算。模型限流可尝试全池未用号，
+普通故障最多 3 次；首次请求取消且无其他活动请求时移除未确认绑定，旧请求不得覆盖新绑定。
 更改调度时同时核对调用方隔离、SSE/非流式、取消、账号禁用与模型限额迁移。
 
 ### 管理界面装配
@@ -125,7 +132,7 @@ src/                       # 后端（Node / Express，TypeScript，按职责分
     models/                models.service · models.controller
     oauth-relay/           oauth-relay.service · oauth-relay.controller
     gateway/               gateway.service · gateway.controller · gateway-key.service
-    scheduling/            account-scheduler（粘性/在途/排队） · session-key（会话摘要）
+    scheduling/            account-scheduler（粘性/在途/排队） · session-key（会话摘要） · model-cooldowns
     frontend/              frontend.controller
 
 tests/                     # 行为/UI 测试（Vitest，*.test.{ts,tsx}；组件用 jsdom）
@@ -174,8 +181,9 @@ pnpm run format:check                          # = vp fmt --check .
 | `DSH_OPENAI_GATEWAY_API_KEY` | 自动生成          | 网关 Bearer Key，优先于文件                                                       |
 | `CODEARTS_MAX_IN_FLIGHT` | `1` | 每账号推理在途上限，1–100，跨模型与调用方共享 |
 | `CODEARTS_QUEUE_LIMIT` | `100` | 等待名额的队列上限，0–10000，0 表示不排队 |
-| `CODEARTS_QUEUE_TIMEOUT_MS` | `15000` | 单次等待名额超时，1–120000 毫秒 |
+| `CODEARTS_QUEUE_TIMEOUT_MS` | `15000` | 同一请求等待名额的截止预算，换号不重置，1–120000 毫秒 |
 | `CODEARTS_STICKY_TTL_MS` | `1800000` | 会话绑定空闲期限，1–86400000 毫秒 |
+| `CODEARTS_STICKY_WAIT_MS` | `1000` | 绑定号满载时优先等待再考虑空闲号，0–120000 毫秒 |
 | `LOG_LEVEL`                  | `info`            | `silent` / `error` / `info` / `debug`                                             |
 
 ### 状态目录
@@ -491,7 +499,10 @@ SecretModal（Esc 不关且 onClose 不被调用）、主题与自动刷新**存
 导出不强制续期；验证刷新后凭据和导入往返，缺失/损坏跳过且提示，不显示原始错误与凭据。
 **CodeArts 调度**：百请求并发在途上限、粘性等待与队列超时/取消、模型限额迁移、旧请求不覆盖新绑定、
 TTL、坏凭据回收，以及真实 HTTP Chat/Responses/聚合入口、SSE 完整生命周期、内部额度换号、
-实际账号续期、输出前失败重试与输出后禁止重放、调用方隔离（仅模拟外部供应商传输）。
+实际账号续期、输出前失败重试与输出后禁止重放、调用方隔离、稳定缓存键/独立任务 ID、
+全池限流轮换与普通故障上限、慢客户端 drain 恢复/取消（仅模拟外部供应商传输）。
+**CodeArts 冷却**：随机 60–180 秒、重复失败不续期、旧长冷却收敛、写盘与其他渠道隔离、
+批量解除所选/全部、鉴权与空选择校验、UI 选择/忙碌/成功与失败反馈。
 
 ### 设计决策：外部图片 URL 为什么被拒
 

@@ -1,10 +1,12 @@
 import { AsyncLocalStorage } from "node:async_hooks"
 import { createHash, randomUUID } from "node:crypto"
+import { once } from "node:events"
 import { LlmError } from "@deepseek-ai/dsh-llm"
 
 import { resolveCodeArtsScheduling } from "../config/env.ts"
 import { assertCodeArtsSchedulingContract, loadCodeArtsConcurrencyClassifier } from "../core/upstream.ts"
 import { createAccountScheduler } from "../modules/scheduling/account-scheduler.ts"
+import { createModelCooldowns } from "../modules/scheduling/model-cooldowns.ts"
 import { installGatewayContext, type GatewayContext } from "./gateway-context.ts"
 
 const ACCOUNT_FAILURES = new Set([
@@ -24,6 +26,15 @@ const ACCOUNT_FAILURES = new Set([
 const accountFailure = (error: any) =>
   error instanceof LlmError ? ACCOUNT_FAILURES.has(error.code) : error?.name !== "AbortError"
 
+function sessionId(state: any, task: boolean) {
+  return createHash("sha256")
+    .update(
+      `sessionId\0${task ? state.requestId : (state.sessionKey ?? state.requestId)}\0${state.lease?.entry.id ?? ""}`,
+    )
+    .digest("hex")
+    .slice(0, 32)
+}
+
 export async function installCodeArtsScheduling(ctx: any) {
   const config = resolveCodeArtsScheduling()
   const isConcurrencyLimitError = await loadCodeArtsConcurrencyClassifier()
@@ -33,25 +44,23 @@ export async function installCodeArtsScheduling(ctx: any) {
   const llm = ctx.get("llm")
   const originalRegister = llm.registerAdapter
   let scheduler: ReturnType<typeof createAccountScheduler>
+  let cooldowns: ReturnType<typeof createModelCooldowns>
 
   llm.registerAdapter = function (providers: string[], adapter: any) {
     if (!providers.includes("codearts")) return originalRegister.call(this, providers, adapter)
     assertCodeArtsSchedulingContract(adapter)
     const options = adapter.options
     const pool = options.accountPool
-    const queueCooldowns = new Map<string, number>()
+    cooldowns = createModelCooldowns(pool, () => scheduler?.wake())
     const queueError = () => new LlmError("CodeArts 当前账号的模型排队中，请稍后重试", "QUEUE", { status: 429 })
     scheduler = createAccountScheduler({
       config,
       candidates: (model, excluded) => {
         const now = Date.now()
-        for (const [key, until] of queueCooldowns) if (until <= now) queueCooldowns.delete(key)
         const available = pool.candidateAccounts("codearts", model, excluded)
         if (
           !available.length &&
-          pool
-            .candidateAccounts("codearts", "", excluded)
-            .some((entry: any) => queueCooldowns.has(`${entry.id}\0${model}`))
+          pool.candidateAccounts("codearts", "", excluded).some((entry: any) => entry.modelRateLimits?.[model] > now)
         ) {
           throw queueError()
         }
@@ -68,6 +77,7 @@ export async function installCodeArtsScheduling(ctx: any) {
             sessionKey: state.sessionKey,
             excluded,
             signal: state.signal,
+            queueDeadline: state.queueDeadline,
           })
           state.attempts++
           state.accounts.add(createHash("sha256").update(state.lease.entry.id).digest("hex").slice(0, 12))
@@ -80,16 +90,20 @@ export async function installCodeArtsScheduling(ctx: any) {
     const rejectQueue = async (state: any) => {
       if (state.lease) {
         // 复用上游的模型限流表，避免新会话不断撞回同一个排队账号。
-        const until = Date.now() + 10_000
-        queueCooldowns.set(`${state.lease.entry.id}\0${state.model}`, until)
-        await pool.updateModelRateLimit(state.lease.entry.id, state.model, until)
+        await pool.updateModelRateLimit(state.lease.entry.id, state.model, Date.now() + 60_000)
       }
       throw queueError()
     }
     const wrapFetch = (transport: any) =>
       async function (this: any, ...args: any[]) {
-        const response = await transport.apply(this, args)
         const state = dispatch.getStore()
+        if (state && typeof args[0] === "string" && args[0].endsWith("/chat/completions")) {
+          // Session-Id 不参与签名；正文缓存键保持稳定，只有队列任务头按请求隔离。
+          const headers = new Headers(args[1]?.headers)
+          headers.set("Session-Id", sessionId(state, true))
+          args[1] = { ...args[1], headers }
+        }
+        const response = await transport.apply(this, args)
         if (state && [400, 403].includes(response.status)) {
           const body = await response.clone().text()
           // TM.00001041 可与 queue/status=working 同时出现，不能依赖队列状态判定。
@@ -121,8 +135,10 @@ export async function installCodeArtsScheduling(ctx: any) {
     }
     const queryQueueStatus = adapter.queryQueueStatus
     adapter.queryQueueStatus = async function (...args: any[]) {
-      const status = await queryQueueStatus.apply(this, args)
       const state = dispatch.getStore()
+      const status = await (state
+        ? dispatch.run({ ...state, queueQuery: true }, () => queryQueueStatus.apply(this, args))
+        : queryQueueStatus.apply(this, args))
       if (state && ["waiting", "queue_full"].includes(status?.status)) await rejectQueue(state)
       return status
     }
@@ -151,14 +167,11 @@ export async function installCodeArtsScheduling(ctx: any) {
       const state = dispatch.getStore()
       if (provider !== "codearts" || !state) return getAvailable.call(this, provider, model, excluded, ...rest)
       if (state.emitted) throw new LlmError("CodeArts 输出后账号受限，已停止重放，请重试", "QUOTA_EXCEEDED")
-      if (state.lease) {
-        state.excluded.add(state.lease.entry.id)
-        state.lease.release("failure")
-        state.lease = undefined
-      }
+      if (state.lease) state.excluded.add(state.lease.entry.id)
       for (const id of excluded ?? []) state.excluded.add(id)
       if (pool.candidateAccounts("codearts", state.model, state.excluded).length === 0) return null
-      return choose(state)
+      // 重新打开适配器流，让换号后的正文缓存键与签名一起按新账号生成。
+      throw new LlmError("CodeArts 当前账号模型受限，切换账号重试", "QUOTA_EXCEEDED")
     }
     for (const property of ["chatId", "sessionId"]) {
       const fallback = adapter[property]
@@ -167,8 +180,8 @@ export async function installCodeArtsScheduling(ctx: any) {
         get() {
           const state = dispatch.getStore()
           if (!state) return fallback
-          // Chat-Id 属于会话；Session-Id 同时是队列 task_id，必须隔离并发推理任务。
-          const identity = property === "chatId" ? (state.sessionKey ?? state.requestId) : state.requestId
+          if (property === "sessionId") return sessionId(state, state.queueQuery === true)
+          const identity = state.sessionKey ?? state.requestId
           return createHash("sha256")
             .update(`${property}\0${identity}\0${state.lease?.entry.id ?? ""}`)
             .digest("hex")
@@ -196,16 +209,20 @@ export async function installCodeArtsScheduling(ctx: any) {
           emitted: false,
           firstChunkMs: undefined as number | undefined,
           firstTextMs: undefined as number | undefined,
+          queueDeadline: Date.now() + config.queueTimeoutMs,
         }
         let success = false
         let failed = false
         try {
-          for (let attempt = 0; ; attempt++) {
+          let otherFailures = 0
+          for (;;) {
             let iterator: AsyncIterator<any> | undefined
             let ended = false
             try {
               iterator = dispatch.run(state, open)[Symbol.asyncIterator]()
               for (;;) {
+                // 上游 SSE 写入不等待 drain；在继续拉取模型内容前传递客户端背压。
+                if (context?.response.writableNeedDrain) await once(context.response, "drain", { signal: state.signal })
                 const step = await dispatch.run(state, () => iterator!.next())
                 if (step.done) {
                   ended = true
@@ -234,7 +251,16 @@ export async function installCodeArtsScheduling(ctx: any) {
                 yield chunk
               }
             } catch (error: any) {
-              if (state.signal?.aborted || state.emitted || !state.lease || !accountFailure(error) || attempt >= 2) {
+              const limited =
+                error instanceof LlmError && ["QUEUE", "RATE_LIMIT", "QUOTA", "QUOTA_EXCEEDED"].includes(error.code)
+              if (!limited) otherFailures++
+              if (
+                state.signal?.aborted ||
+                state.emitted ||
+                !state.lease ||
+                !accountFailure(error) ||
+                otherFailures >= 3
+              ) {
                 failed = accountFailure(error) && !state.signal?.aborted
                 throw error
               }
@@ -287,6 +313,7 @@ export async function installCodeArtsScheduling(ctx: any) {
       llm.registerAdapter = originalRegister
       detach()
       scheduler?.close()
+      cooldowns?.close()
     },
     "codearts-scheduling",
   )
@@ -294,6 +321,8 @@ export async function installCodeArtsScheduling(ctx: any) {
     assertReady() {
       if (!scheduler) throw new Error("上游未注册 CodeArts 调度入口，请核对 src/core/upstream.ts")
     },
+    normalizeCooldowns: () => cooldowns.normalize(),
+    clearCooldowns: (selection: Parameters<typeof cooldowns.clear>[0]) => cooldowns.clear(selection),
     stats: () => scheduler?.stats(),
   }
 }

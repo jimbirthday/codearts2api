@@ -92,5 +92,9 @@ export function createModelsController({ service }: { service: ModelsService }) 
     )
   })
 
+  router.post("/:provider/cooldowns/clear", async (request, response) => {
+    sendJson(response, 200, await service.clearCooldowns({ ...request.body, provider: request.params.provider }))
+  })
+
   return { router }
 }

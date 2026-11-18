@@ -5,6 +5,7 @@ export interface SchedulingConfig {
   queueLimit: number
   queueTimeoutMs: number
   stickyTtlMs: number
+  stickyWaitMs: number
 }
 
 interface Selection {
@@ -12,12 +13,15 @@ interface Selection {
   sessionKey?: string
   excluded: Set<string>
   signal?: AbortSignal
+  preferUntil?: number
+  queueDeadline?: number
 }
 
 interface Binding {
   accountId: string
   expiresAt: number
   active: number
+  confirmed: boolean
 }
 
 type ReleaseReason = "success" | "failure" | "cancel"
@@ -84,6 +88,18 @@ export function createAccountScheduler({
         status: 503,
       })
 
+    if (
+      binding &&
+      (loads.get(binding.accountId)?.inFlight ?? 0) >= config.maxInFlight &&
+      Date.now() >= (selection.preferUntil ?? Infinity) &&
+      available.some(
+        (entry) => entry.id !== binding!.accountId && (loads.get(entry.id)?.inFlight ?? 0) < config.maxInFlight,
+      )
+    ) {
+      unbind(key!, binding)
+      binding = undefined
+    }
+
     const eligible = binding ? available.filter((entry) => entry.id === binding.accountId) : available
     let picked: any
     for (const entry of eligible) {
@@ -110,7 +126,7 @@ export function createAccountScheduler({
         }
         if (bindings.size >= 10_000) throw busy()
       }
-      binding = { accountId: picked.id, expiresAt: 0, active: 0 }
+      binding = { accountId: picked.id, expiresAt: 0, active: 0, confirmed: false }
       bindings.set(key, binding)
       boundCounts.set(picked.id, (boundCounts.get(picked.id) ?? 0) + 1)
     }
@@ -133,7 +149,10 @@ export function createAccountScheduler({
         if (binding) {
           binding.active--
           if (reason === "failure") unbind(key!, binding)
-          else if (reason === "success") touch(key!, binding)
+          else if (reason === "success") {
+            binding.confirmed = true
+            touch(key!, binding)
+          } else if (binding.active === 0 && !binding.confirmed) unbind(key!, binding)
         }
         pump()
       },
@@ -162,10 +181,13 @@ export function createAccountScheduler({
     const slot = reserve(selection)
     if (slot) return Promise.resolve(slot)
     if (waiting.size >= config.queueLimit) throw busy()
+    const waitMs = Math.min(config.queueTimeoutMs, (selection.queueDeadline ?? Infinity) - Date.now())
+    if (waitMs <= 0) throw busy()
     return new Promise((ready, fail) => {
       const finish = (error: unknown, reserved?: any) => {
         if (!waiting.delete(ticket)) return
         clearTimeout(timer)
+        clearTimeout(preferTimer)
         selection.signal?.removeEventListener("abort", abort)
         if (error) fail(error)
         else ready(reserved)
@@ -176,7 +198,8 @@ export function createAccountScheduler({
         ready: (reserved: any) => finish(null, reserved),
         fail: (error: unknown) => finish(error),
       }
-      const timer = setTimeout(() => finish(busy()), config.queueTimeoutMs)
+      const timer = setTimeout(() => finish(busy()), waitMs)
+      const preferTimer = setTimeout(pump, Math.max(0, (selection.preferUntil ?? Date.now()) - Date.now()))
       waiting.add(ticket)
       selection.signal?.addEventListener("abort", abort, { once: true })
       if (selection.signal?.aborted) abort()
@@ -190,6 +213,7 @@ export function createAccountScheduler({
   timer.unref()
   return {
     async acquire(selection: Selection) {
+      selection = { preferUntil: Date.now() + config.stickyWaitMs, ...selection }
       const excluded = new Set(selection.excluded)
       for (;;) {
         const slot = await take({ ...selection, excluded })
@@ -215,6 +239,7 @@ export function createAccountScheduler({
         bindings: bindings.size,
       }
     },
+    wake: pump,
     close() {
       closed = true
       clearInterval(timer)

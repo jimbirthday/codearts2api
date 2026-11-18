@@ -223,6 +223,7 @@ export async function createHost() {
   //    此处不 try/catch：插件装不上就是致命错误，不该带着残缺状态继续服务。
   const fiber = await ctx.plugin(plugin)
   codeartsScheduling.assertReady()
+  await codeartsScheduling.normalizeCooldowns()
 
   // ⑥ 核对上游契约 —— **启动即失败，而不是等用户点到某个按钮才 404**。
   //

@@ -9,7 +9,14 @@ import { schedulingSessionKey } from "../src/modules/scheduling/session-key.ts"
 function setup(t: any, config: any = {}, resolve?: (entry: any) => Promise<any>) {
   const entries = ["a", "b", "c"].map((id) => ({ id, enabled: true, blocked: new Set<string>() }))
   const scheduler = createAccountScheduler({
-    config: { maxInFlight: 1, queueLimit: 100, queueTimeoutMs: 1000, stickyTtlMs: 30_000, ...config },
+    config: {
+      maxInFlight: 1,
+      queueLimit: 100,
+      queueTimeoutMs: 1000,
+      stickyTtlMs: 30_000,
+      stickyWaitMs: 1000,
+      ...config,
+    },
     candidates: (model, excluded) =>
       entries.filter((entry) => entry.enabled && !entry.blocked.has(model) && !excluded.has(entry.id)),
     resolve: resolve ?? (async (entry) => ({ entry, credential: { fake: true } })),
@@ -80,6 +87,33 @@ test("队列有上限、有超时，排队请求取消后立即退出", async (t
   assert.equal(scheduler.stats().inFlight, 0)
 })
 
+test("粘性号忙超过短等待时使用空闲号，旧请求不能覆盖新绑定", async (t) => {
+  const { acquire } = setup(t, { stickyWaitMs: 20 })
+  const held = await acquire("sticky")
+  const moved = await acquire("sticky")
+  assert.notEqual(held.entry.id, moved.entry.id)
+  held.release("success")
+  moved.release("success")
+  const later = await acquire("sticky")
+  assert.equal(later.entry.id, moved.entry.id)
+  later.release("success")
+})
+
+test("满载排队遵守请求剩余预算，不重新开始一个完整等待窗口", async (t) => {
+  const { scheduler, acquire, entries } = setup(t)
+  entries[1].enabled = entries[2].enabled = false
+  const free = await scheduler.acquire({ model: "model", excluded: new Set(), queueDeadline: Date.now() - 1 })
+  free.release()
+  const held = await acquire("held")
+  const started = Date.now()
+  await assert.rejects(
+    scheduler.acquire({ model: "model", excluded: new Set(), queueDeadline: Date.now() + 20 }),
+    (error: any) => error.code === "RATE_LIMIT",
+  )
+  assert.ok(Date.now() - started < 500)
+  held.release()
+})
+
 test("模型限额/停用会迁移绑定，旧请求完成不能覆盖新绑定", async (t) => {
   const { entries, acquire } = setup(t, { maxInFlight: 2 })
   const first = await acquire("same")
@@ -139,6 +173,19 @@ test("绑定 TTL 滚动续期，过期后重新分配", async (t) => {
   expired.release()
 })
 
+test("取消首次请求不保留未成功的绑定；已有成功绑定不因取消而丢失", async (t) => {
+  const { acquire, scheduler } = setup(t)
+  const canceled = await acquire("new")
+  canceled.release("cancel")
+  assert.equal(scheduler.stats().bindings, 0)
+  const completed = await acquire("new")
+  completed.release("success")
+  const later = await acquire("new")
+  assert.equal(later.entry.id, completed.entry.id)
+  later.release("cancel")
+  assert.equal(scheduler.stats().bindings, 1)
+})
+
 test("会话键：显式 ID 优先、按调用方隔离、兼容 Responses，历史追加保持派生键", () => {
   const headers = { authorization: "Bearer test", "x-caller-id": "one" }
   const chat = { metadata: { conversation_id: "same" }, messages: [{ role: "user", content: "hello" }] }
@@ -161,6 +208,15 @@ test("会话键：显式 ID 优先、按调用方隔离、兼容 Responses，历
   assert.equal(schedulingSessionKey(initial, headers), schedulingSessionKey(later, headers))
   assert.equal(schedulingSessionKey({}, headers), undefined)
   assert.doesNotMatch(schedulingSessionKey(initial, headers)!, /system|first|Bearer/)
+  const codex = { ...headers, session_id: "client-session" }
+  assert.equal(
+    schedulingSessionKey({ prompt_cache_key: "turn-1" }, codex),
+    schedulingSessionKey({ prompt_cache_key: "turn-2" }, codex),
+  )
+  assert.notEqual(
+    schedulingSessionKey({ prompt_cache_key: "shared" }, codex),
+    schedulingSessionKey({ prompt_cache_key: "shared" }, { ...codex, session_id: "another-session" }),
+  )
 })
 
 test("调度配置非法值直接失败，默认保守限制每号 1 个在途", () => {

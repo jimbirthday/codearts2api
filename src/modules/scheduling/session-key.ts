@@ -18,9 +18,12 @@ export function schedulingSessionKey(body: any, headers: Record<string, any>): s
     body?.metadata?.conversationId,
     body?.conversation_id,
     body?.conversationId,
-    body?.prompt_cache_key,
+    headers.conversation_id,
+    headers.session_id,
     headers["x-conversation-id"],
     headers["x-session-id"],
+    headers["x-claude-code-session-id"],
+    body?.prompt_cache_key,
   ].find((value) => typeof value === "string" && value.trim() && value.length <= 2048)
   let identity: string[]
   if (explicit) {

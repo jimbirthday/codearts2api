@@ -53,9 +53,16 @@ export function assertCodeArtsSchedulingContract(adapter: any) {
   const pool = adapter?.options?.accountPool
   if (
     !pool ||
-    !["candidateAccounts", "resolveFirstCredential", "getAvailableAccount", "updateModelRateLimit"].every(
-      (name) => typeof pool[name] === "function",
-    ) ||
+    ![
+      "candidateAccounts",
+      "resolveFirstCredential",
+      "getAvailableAccount",
+      "updateModelRateLimit",
+      "clearModelRateLimits",
+      "findAccount",
+      "getStateSnapshot",
+      "updateAccount",
+    ].every((name) => typeof pool[name] === "function") ||
     typeof adapter.options.resolveCredential !== "function" ||
     typeof adapter.options.refresh !== "function" ||
     typeof adapter.prepareCall !== "function" ||

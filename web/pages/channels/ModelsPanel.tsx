@@ -84,6 +84,9 @@ export function ModelsPanel() {
   const [filter, setFilter] = useState("all")
   const [busy, setBusy] = useState<Record<string, boolean>>({})
   const [err, setErr] = useState<string | null>(null)
+  const [selected, setSelected] = useState<Record<string, boolean>>({})
+  const [clearing, setClearing] = useState(false)
+  const [notice, setNotice] = useState("")
   const providerIdRef = useRef<string>("")
   providerIdRef.current = provider ? provider.id : ""
 
@@ -118,6 +121,8 @@ export function ModelsPanel() {
     setData(null)
     setQ("")
     setFilter("all")
+    setSelected({})
+    setNotice("")
     load(provider.id)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [provider?.id])
@@ -136,6 +141,33 @@ export function ModelsPanel() {
 
   const counts = (data && data.counts) || { total: 0, usable: 0, partial: 0, limited: 0, off: 0, dead: 0 }
   const rows = data ? visibleModels(data, q, filter) : []
+  const coolingRows = rows.filter((model: any) => model.limitedAccounts > 0)
+  const selectedIds = Object.keys(selected).filter((id) => selected[id])
+  const allVisibleSelected = coolingRows.length > 0 && coolingRows.every((model: any) => selected[model.id])
+
+  const clearCooldowns = async (all: boolean) => {
+    if (clearing || provider.id !== "codearts" || (!all && !selectedIds.length)) return
+    const id = provider.id
+    setClearing(true)
+    setNotice("")
+    setErr(null)
+    try {
+      const result = await request("/codearts/cooldowns/clear", {
+        method: "POST",
+        body: JSON.stringify(all ? { all: true } : { modelIds: selectedIds }),
+      })
+      if (providerIdRef.current !== id) return
+      await load(id)
+      if (providerIdRef.current !== id) return
+      setNotice(`已解除 ${result.cleared} 条模型冷却，涉及 ${result.affectedAccounts} 个账号`)
+      if (result.failed.length) setErr(`${result.failed.length} 个账号解除失败，请重试`)
+      else setSelected({})
+    } catch {
+      if (providerIdRef.current === id) setErr("解除冷却失败，请检查网络和登录状态后重试")
+    } finally {
+      setClearing(false)
+    }
+  }
 
   const onToggle = async (m: any) => {
     const id = provider.id
@@ -191,7 +223,13 @@ export function ModelsPanel() {
               {t.label} <span className={styles.t}>{t.n}</span>
             </button>
           ))}
-          <button type="button" className={styles.icon} title="刷新" onClick={() => load(provider.id)}>
+          <button
+            type="button"
+            className={styles.icon}
+            title="刷新"
+            disabled={clearing}
+            onClick={() => load(provider.id)}
+          >
             ↻
           </button>
           <button
@@ -206,6 +244,50 @@ export function ModelsPanel() {
       </div>
       {open ? (
         <>
+          {provider.id === "codearts" ? (
+            <div className={styles.actions} aria-busy={clearing}>
+              <label className={styles.select}>
+                <input
+                  type="checkbox"
+                  checked={allVisibleSelected}
+                  disabled={clearing || !coolingRows.length}
+                  onChange={() =>
+                    setSelected((previous) => {
+                      const next = { ...previous }
+                      for (const model of coolingRows) {
+                        if (allVisibleSelected) delete next[model.id]
+                        else next[model.id] = true
+                      }
+                      return next
+                    })
+                  }
+                />
+                全选当前限流模型
+              </label>
+              <button
+                type="button"
+                className="c2a-btn"
+                disabled={clearing || !selectedIds.length}
+                onClick={() => clearCooldowns(false)}
+              >
+                解除所选冷却（{selectedIds.length}）
+              </button>
+              <button
+                type="button"
+                className="c2a-btn"
+                disabled={clearing || !data || !!data.accountsError}
+                onClick={() => clearCooldowns(true)}
+              >
+                {clearing ? "解除中…" : "解除全部冷却"}
+              </button>
+              <span>默认冷却 1–3 分钟</span>
+            </div>
+          ) : null}
+          {notice ? (
+            <div className={styles.notice} role="status">
+              {notice}
+            </div>
+          ) : null}
           <div className={styles.sum}>
             <span className={styles.ok}>
               可用 <b>{counts.usable}</b>
@@ -240,6 +322,20 @@ export function ModelsPanel() {
                   m.enabledAccounts > 0 ? m.usableAccounts + "/" + m.enabledAccounts + " 号可用" : "无账号"
                 return (
                   <div key={m.id} className={styles.mrow} data-state={m.state} data-model={m.id}>
+                    {provider.id === "codearts" ? (
+                      <label className={styles.select}>
+                        <input
+                          type="checkbox"
+                          aria-label={`${m.name || m.id} 冷却选择`}
+                          checked={!!selected[m.id]}
+                          disabled={clearing || (!m.limitedAccounts && !selected[m.id])}
+                          onChange={(event) => {
+                            const checked = event.target.checked
+                            setSelected((previous) => ({ ...previous, [m.id]: checked }))
+                          }}
+                        />
+                      </label>
+                    ) : null}
                     <span className={styles.dot} />
                     <span className={styles.name} title={m.name || m.id}>
                       {m.name || m.id}
@@ -262,7 +358,7 @@ export function ModelsPanel() {
                       role="switch"
                       aria-checked={m.disabled ? "false" : "true"}
                       aria-label={(m.name || m.id) + " 是否启用"}
-                      disabled={isBusy}
+                      disabled={isBusy || clearing}
                       onClick={() => onToggle(m)}
                     />
                   </div>
@@ -273,7 +369,11 @@ export function ModelsPanel() {
           {data && data.accountsError ? (
             <div className={styles.err}>{data.accountsError} —— 限流状态不可信，请刷新重试</div>
           ) : null}
-          {err ? <div className={styles.err}>{err}</div> : null}
+          {err ? (
+            <div className={styles.err} role="alert">
+              {err}
+            </div>
+          ) : null}
           <div className={styles.note}>
             「可用」＝ 至少还有一个已启用账号没被该模型限流；「全部限流」＝ 所有已启用账号都在重置窗口内。关闭开关后下游{" "}
             <code>/v1/models</code> 不再列出该模型。

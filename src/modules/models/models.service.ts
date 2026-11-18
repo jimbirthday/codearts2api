@@ -61,6 +61,7 @@ function summarizeCounts(rows: any[]) {
 export interface ModelsServiceOptions {
   rpc: (method: string, payload?: any) => Promise<any>
   logger?: Logger
+  clearCooldowns?: (selection: any) => Promise<any>
 }
 
 export function createModelsService(options: ModelsServiceOptions) {
@@ -122,7 +123,13 @@ export function createModelsService(options: ModelsServiceOptions) {
     return { ok: true, warnings: value?.warnings ?? [] }
   }
 
-  return { list, overview, status, toggle, toggleMany }
+  async function clearCooldowns({ provider, ...selection }: any) {
+    if (provider !== "codearts") throw new ModelsError(400, "当前仅支持解除 CodeArts 模型冷却")
+    if (!options.clearCooldowns) throw new ModelsError(503, "CodeArts 调度器未就绪")
+    return options.clearCooldowns(selection)
+  }
+
+  return { list, overview, status, toggle, toggleMany, clearCooldowns }
 }
 
 export type ModelsService = ReturnType<typeof createModelsService>

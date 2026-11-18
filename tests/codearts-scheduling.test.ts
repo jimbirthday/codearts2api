@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import { test, vi } from "vite-plus/test"
 import { credentialRef } from "@deepseek-ai/dsh-credentials"
 import { createHash } from "node:crypto"
+import { subscribe, unsubscribe } from "node:diagnostics_channel"
 import { mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -36,7 +37,7 @@ async function setup(t: any, count = 2, config: Record<string, string> = {}, opt
   adapter.options.catalogComplete = () => true
   const status = (await rpc(app.origin, "gateway.getEnabled")).value
   const key = status.apiKey.value
-  const calls: Array<{ account: string; chat: string; session: string }> = []
+  const calls: Array<{ account: string; chat: string; session: string; cacheKey: string }> = []
   let answer = async (_url: string, _init: any): Promise<Response> => completion()
   adapter.fetchImpl = (url: string, init: any) => {
     assert.match(url, /chat\/completions$|queue\/status\?/)
@@ -44,7 +45,12 @@ async function setup(t: any, count = 2, config: Record<string, string> = {}, opt
     const account = /Access=([^,\s]+)/.exec(headers.get("authorization")!)?.[1] ?? ""
     assert.ok(account)
     if (url.endsWith("/chat/completions"))
-      calls.push({ account, chat: headers.get("chat-id")!, session: headers.get("session-id")! })
+      calls.push({
+        account,
+        chat: headers.get("chat-id")!,
+        session: headers.get("session-id")!,
+        cacheKey: JSON.parse(init.body).prompt_cache_key,
+      })
     return answer(url, init)
   }
   const send = (session: string, extra: any = {}, origin = app.origin, path = "/v1/chat/completions") => {
@@ -84,10 +90,14 @@ test("真实 Chat/Responses/直连网关：会话固定账号与 Chat-Id，每�
   assert.notEqual(env.calls[0].account, env.calls[1].account)
   assert.equal(env.calls[0].chat, env.calls[2].chat)
   assert.notEqual(env.calls[0].session, env.calls[2].session)
+  assert.equal(env.calls[0].cacheKey, env.calls[2].cacheKey)
+  assert.notEqual(env.calls[0].cacheKey, env.calls[1].cacheKey)
+  assert.notEqual(env.calls[0].cacheKey, env.calls[0].session)
   const response = await env.send("first", { input: "hello", messages: undefined }, env.direct, "/v1/responses")
   assert.equal(response.status, 200, JSON.stringify(await response.json()))
   assert.equal(env.calls[0].account, env.calls[3].account)
   assert.equal(env.calls[0].chat, env.calls[3].chat)
+  assert.equal(env.calls[0].cacheKey, env.calls[3].cacheKey)
   assert.notEqual(env.calls[0].session, env.calls[3].session)
   assert.notEqual(env.calls[0].chat, env.calls[1].chat)
   assert.equal(env.app.host.codeartsScheduling.stats().inFlight, 0)
@@ -171,6 +181,56 @@ test("流式输出期间继续占用名额；排队取消与生成取消都回�
   assert.equal(env.calls.length, 1)
 })
 
+for (const cancel of [false, true]) {
+  test(`慢客户端暂停拉取模型流，${cancel ? "取消回收名额" : "drain 后继续输出"}`, async (t) => {
+    const env = await setup(t, 1)
+    let outgoing: any
+    let blocked = false
+    const listener = ({ server, response }: any) => {
+      if (server.address()?.port !== Number(new URL(env.direct).port)) return
+      outgoing = response
+      Object.defineProperty(response, "writableNeedDrain", { get: () => blocked })
+      const write = response.write
+      response.write = function (...args: any[]) {
+        if (String(args[0]).includes("HELLO")) blocked = true
+        return write.apply(this, args)
+      }
+    }
+    subscribe("http.server.request.start", listener)
+    t.onTestFinished(() => unsubscribe("http.server.request.start", listener))
+    env.setAnswer(
+      async () =>
+        new Response(delta("HELLO") + delta("LATER") + end, {
+          headers: { "content-type": "text/event-stream" },
+        }),
+    )
+    const abort = new AbortController()
+    const response = await env.send("backpressure", { stream: true, signal: abort.signal })
+    const reader = response.body!.getReader()
+    let body = ""
+    while (!body.includes("HELLO")) body += new TextDecoder().decode((await reader.read()).value)
+    await vi.waitFor(() => assert.ok(outgoing.listenerCount("drain") > 0))
+    assert.equal(env.app.host.codeartsScheduling.stats().inFlight, 1)
+    assert.doesNotMatch(body, /LATER/)
+    if (cancel) {
+      abort.abort()
+      await reader.cancel().catch(() => {})
+    } else {
+      blocked = false
+      outgoing.emit("drain")
+      for (;;) {
+        const next = await reader.read()
+        if (next.done) break
+        body += new TextDecoder().decode(next.value)
+      }
+      assert.match(body, /LATER/)
+    }
+    await vi.waitFor(() => assert.equal(env.app.host.codeartsScheduling.stats().inFlight, 0))
+    assert.equal(outgoing.listenerCount("drain"), 0)
+    assert.equal(env.calls.length, 1)
+  })
+}
+
 test("内部模型额度换号经过同一租约，后续会话粘住最终成功账号", async (t) => {
   const env = await setup(t)
   env.setAnswer(async () =>
@@ -188,8 +248,38 @@ test("内部模型额度换号经过同一租约，后续会话粘住最终成�
   assert.equal(later.status, 200, JSON.stringify(await later.json()))
   assert.equal(env.calls[1].account, env.calls[2].account)
   assert.equal(env.calls[1].chat, env.calls[2].chat)
+  assert.equal(env.calls[1].cacheKey, env.calls[2].cacheKey)
+  assert.notEqual(env.calls[0].cacheKey, env.calls[1].cacheKey)
   const listed = await rpc(env.app.origin, "account.list", { provider: "codearts" })
   assert.ok(listed.value.accounts.some((account: any) => account.modelRateLimits?.[MODEL] > Date.now()))
+  assert.equal(env.app.host.codeartsScheduling.stats().inFlight, 0)
+})
+
+test("模型限流轮换可遍历全部账号；普通传输失败仍最多尝试 3 个", async (t) => {
+  const env = await setup(t, 5)
+  env.setAnswer(async () =>
+    env.calls.length < 5
+      ? new Response('data: {"error_code":"InferHub.ModelArts.81111.429","error_msg":"busy"}\n\n', {
+          headers: { "content-type": "text/event-stream" },
+        })
+      : completion(),
+  )
+  const response = await env.send("many")
+  assert.equal(response.status, 200, JSON.stringify(await response.json()))
+  assert.equal(env.calls.length, 5)
+  assert.equal(new Set(env.calls.map((call) => call.account)).size, 5)
+  assert.equal(env.app.host.codeartsScheduling.stats().inFlight, 0)
+})
+
+test("传输故障不会在大账号池无限轮转", async (t) => {
+  const env = await setup(t, 5)
+  env.setAnswer(async () => {
+    throw new TypeError("fetch failed")
+  })
+  const response = await env.send("transport")
+  assert.notEqual(response.status, 200)
+  await response.json()
+  assert.equal(env.calls.length, 3)
   assert.equal(env.app.host.codeartsScheduling.stats().inFlight, 0)
 })
 
@@ -197,7 +287,10 @@ for (const kind of ["SSE", "HTTP"]) {
   test(`${kind} 上游排队立即换号，不持有租约等待 10 秒重试`, async (t) => {
     const env = await setup(t)
     env.setAnswer(async (url) => {
-      if (url.includes("/queue/status")) return Response.json({ status: "waiting", queue_position: 2 })
+      if (url.includes("/queue/status")) {
+        assert.equal(new URL(url).searchParams.get("task_id"), env.calls[0].session)
+        return Response.json({ status: "waiting", queue_position: 2 })
+      }
       if (env.calls.length !== 1) return completion()
       return kind === "SSE"
         ? new Response('data: {"error_code":"InferHub.ModelArts.81111.429","error_msg":"busy"}\n\n', {

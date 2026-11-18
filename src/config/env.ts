@@ -59,5 +59,6 @@ export function resolveCodeArtsScheduling(env = process.env) {
     queueLimit: integer("CODEARTS_QUEUE_LIMIT", 100, 0, 10_000),
     queueTimeoutMs: integer("CODEARTS_QUEUE_TIMEOUT_MS", 15_000, 1, 120_000),
     stickyTtlMs: integer("CODEARTS_STICKY_TTL_MS", 1_800_000, 1, 86_400_000),
+    stickyWaitMs: integer("CODEARTS_STICKY_WAIT_MS", 1000, 0, 120_000),
   }
 }
