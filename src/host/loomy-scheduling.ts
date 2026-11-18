@@ -2,10 +2,10 @@ import { AsyncLocalStorage } from "node:async_hooks"
 import { createHash, randomInt } from "node:crypto"
 import { LlmError } from "@deepseek-ai/dsh-llm"
 
-import { resolveLoomyScheduling } from "../config/env.ts"
 import { assertLoomySchedulingContract, loadLoomyScheduling, loadSchedulingLedger } from "../core/upstream.ts"
 import { createAccountScheduler } from "../modules/scheduling/account-scheduler.ts"
 import { clearModelCooldowns } from "../modules/scheduling/model-cooldowns.ts"
+import type { ChannelSchedulingConfig } from "../modules/scheduling/scheduling-settings.service.ts"
 import type { GatewayContext } from "./gateway-context.ts"
 import { acquireScheduledAccount, wrapScheduledAdapter } from "./scheduled-adapter.ts"
 
@@ -24,10 +24,13 @@ async function readBalances(readings: Promise<any>[], signal?: AbortSignal) {
   }
 }
 
-export async function installLoomyScheduling(ctx: any, gateway: AsyncLocalStorage<GatewayContext>) {
+export async function installLoomyScheduling(
+  ctx: any,
+  gateway: AsyncLocalStorage<GatewayContext>,
+  config: ChannelSchedulingConfig,
+) {
   const native = await loadLoomyScheduling()
   const reportAccount = await loadSchedulingLedger()
-  const config = resolveLoomyScheduling()
   const dispatch = new AsyncLocalStorage<any>()
   const llm = ctx.get("llm")
   const register = llm.registerAdapter
@@ -125,7 +128,9 @@ export async function installLoomyScheduling(ctx: any, gateway: AsyncLocalStorag
         await pool.updateModelRateLimit(
           state.lease.entry.id,
           state.model,
-          kind === "quota" ? native.quotaResetAt("quota") : Date.now() + randomInt(60, 181) * 1000,
+          kind === "quota"
+            ? native.quotaResetAt("quota")
+            : Date.now() + randomInt(config.cooldownMinSeconds, config.cooldownMaxSeconds + 1) * 1000,
         )
     }
     const code = (kind: string) => (kind === "auth" ? "AUTH" : kind === "quota" ? "QUOTA_EXCEEDED" : "RATE_LIMIT")
@@ -215,6 +220,7 @@ export async function installLoomyScheduling(ctx: any, gateway: AsyncLocalStorag
       if (!scheduler) throw new Error("上游未注册 Loomy 调度入口，请核对 src/core/upstream.ts")
     },
     stats: () => scheduler?.stats(),
+    wake: () => scheduler?.wake(),
     async clearCooldowns(selection: any) {
       const result = await clearModelCooldowns(pool, "loomy", selection)
       scheduler.wake()

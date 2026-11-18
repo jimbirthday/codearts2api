@@ -144,6 +144,63 @@ test("Loomy 默认并发：16 请求、2 账号每号峰值为 2，流结束后�
   assert.equal(env.app.host.loomyScheduling.stats().inFlight, 0)
 })
 
+test("管理界面保存 Loomy 在途上限后，实际 HTTP 排队立即放行，正在输出的流继续完成", async (t) => {
+  const env = await setup(t, 1, { LOOMY_MAX_IN_FLIGHT: "1" })
+  let finish!: () => void
+  env.setAnswer(async () => {
+    if (env.calls.length > 1) return completion()
+    return new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode(delta("HELLO")))
+          finish = () => {
+            controller.enqueue(encoder.encode(end))
+            controller.close()
+          }
+        },
+      }),
+      { headers: { "content-type": "text/event-stream" } },
+    )
+  })
+  const first = await env.send("first", { stream: true })
+  const reader = first.body!.getReader()
+  await reader.read()
+  const waiting = env.send("second")
+  await vi.waitFor(() => assert.equal(env.app.host.loomyScheduling.stats().queued, 1))
+  const updated = await fetch(`${env.app.origin}/admin/scheduling/api/loomy`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json", authorization: `Bearer ${env.app.adminKey}` },
+    body: JSON.stringify({ maxInFlight: 2 }),
+  })
+  assert.equal(updated.status, 200)
+  const second = await waiting
+  assert.equal(second.status, 200, JSON.stringify(await second.json()))
+  assert.equal(env.calls.length, 2)
+  assert.equal(env.app.host.loomyScheduling.stats().inFlight, 1)
+  finish()
+  while (!(await reader.read()).done) {
+    /* 排空 SSE。 */
+  }
+  await vi.waitFor(() => assert.equal(env.app.host.loomyScheduling.stats().inFlight, 0))
+})
+
+test("Loomy 模型限流使用热更新后的冷却区间，积分耗尽规则不被替换", async (t) => {
+  const env = await setup(t)
+  await env.app.host.schedulingSettings.update("loomy", { cooldownMinSeconds: 2, cooldownMaxSeconds: 2 })
+  env.setAnswer(async () => (env.calls.length === 1 ? new Response("rate limit", { status: 429 }) : completion()))
+  const response = await env.send("configured-cooldown")
+  assert.equal(response.status, 200, JSON.stringify(await response.json()))
+  const resetAt = env.pool.findAccount(env.batch.payload.accounts[0].id).modelRateLimits[MODEL]
+  assert.ok(resetAt > Date.now() + 1000 && resetAt <= Date.now() + 2000)
+  env.setAnswer(async () => new Response("credits exhausted", { status: 402 }))
+  const exhausted = await env.send("configured-quota")
+  await exhausted.json()
+  const quotaReset = env.pool.findAccount(env.batch.payload.accounts[1].id).modelRateLimits[MODEL]
+  const local = new Date(quotaReset + 8 * 3600000)
+  assert.equal(local.getUTCHours(), 0)
+  assert.equal(local.getUTCMinutes(), 0)
+})
+
 for (const kind of ["rate", "quota", "auth", "sse-quota"]) {
   test(`Loomy ${kind} 输出前自动换号，缓存键随实际账号重建并持久化正确冷却`, async (t) => {
     const env = await setup(t, 4)

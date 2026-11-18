@@ -5,6 +5,7 @@ import { ensureUpstreamPage } from "../../api/upstream"
 import { AccountImport } from "./AccountImport"
 import { MobileProviderPicker } from "./MobileProviderPicker"
 import { ModelsPanelHost } from "./ModelsPanelHost"
+import { SchedulingSettings } from "./SchedulingSettings"
 
 function ChannelsView({ revision }: { revision: number }) {
   const [Page, setPage] = useState<React.ComponentType<any> | null>(null)
@@ -33,6 +34,7 @@ export default function ChannelsPage() {
   const [revision, setRevision] = useState(0)
   return (
     <div className="c2a-view" id="admin-root" data-view="channels" role="tabpanel" aria-label="渠道管理">
+      <SchedulingSettings />
       <AccountImport onImported={() => setRevision((value) => value + 1)} />
       <AccountImport provider="loomy" onImported={() => setRevision((value) => value + 1)} />
       <ChannelsView revision={revision} />

@@ -3,7 +3,11 @@ import { randomInt } from "node:crypto"
 import { AppError } from "../../core/errors.ts"
 
 /** CodeArts 的本地避让期限；状态读写与持久化仍由上游账号池负责。 */
-export function createModelCooldowns(pool: any, changed: () => void) {
+export function createModelCooldowns(
+  pool: any,
+  changed: () => void,
+  config = { cooldownMinSeconds: 60, cooldownMaxSeconds: 180 },
+) {
   const update = pool.updateModelRateLimit
   const clear = pool.clearModelRateLimits
   let pending = Promise.resolve<any>(undefined)
@@ -12,7 +16,7 @@ export function createModelCooldowns(pool: any, changed: () => void) {
     pending = result.catch(() => {})
     return result
   }
-  const until = () => Date.now() + randomInt(60, 181) * 1000
+  const until = () => Date.now() + randomInt(config.cooldownMinSeconds, config.cooldownMaxSeconds + 1) * 1000
   const accounts = () => pool.getStateSnapshot().accounts.filter((entry: any) => entry.provider === "codearts")
 
   pool.updateModelRateLimit = function (id: string, model: string, resetAt: number) {
@@ -24,8 +28,8 @@ export function createModelCooldowns(pool: any, changed: () => void) {
       const now = Date.now()
       const current = pool.findAccount(id)?.modelRateLimits?.[key]
       // 冷却期间的并发失败不续期；旧版本的长冷却在下次写入时收敛。
-      if (current > now && current <= now + 180_000) return
-      if (current > now + 180_000) await clear.call(pool, id, [key])
+      if (current > now && current <= now + config.cooldownMaxSeconds * 1000) return
+      if (current > now + config.cooldownMaxSeconds * 1000) await clear.call(pool, id, [key])
       await update.call(pool, id, key, until())
       changed()
     })
@@ -47,7 +51,7 @@ export function createModelCooldowns(pool: any, changed: () => void) {
           const limits = { ...account.modelRateLimits }
           let dirty = false
           for (const [model, resetAt] of Object.entries(limits)) {
-            if (typeof resetAt === "number" && resetAt > Date.now() + 180_000) {
+            if (typeof resetAt === "number" && resetAt > Date.now() + config.cooldownMaxSeconds * 1000) {
               limits[model] = until()
               dirty = true
               shortened++

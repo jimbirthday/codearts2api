@@ -2,7 +2,6 @@ import { AsyncLocalStorage } from "node:async_hooks"
 import { createHash } from "node:crypto"
 import { LlmError } from "@deepseek-ai/dsh-llm"
 
-import { resolveCodeArtsScheduling } from "../config/env.ts"
 import {
   assertCodeArtsSchedulingContract,
   loadCodeArtsConcurrencyClassifier,
@@ -10,6 +9,7 @@ import {
 } from "../core/upstream.ts"
 import { createAccountScheduler } from "../modules/scheduling/account-scheduler.ts"
 import { createModelCooldowns } from "../modules/scheduling/model-cooldowns.ts"
+import type { ChannelSchedulingConfig } from "../modules/scheduling/scheduling-settings.service.ts"
 import type { GatewayContext } from "./gateway-context.ts"
 import { acquireScheduledAccount, wrapScheduledAdapter } from "./scheduled-adapter.ts"
 
@@ -22,8 +22,11 @@ function sessionId(state: any, task: boolean) {
     .slice(0, 32)
 }
 
-export async function installCodeArtsScheduling(ctx: any, gateway: AsyncLocalStorage<GatewayContext>) {
-  const config = resolveCodeArtsScheduling()
+export async function installCodeArtsScheduling(
+  ctx: any,
+  gateway: AsyncLocalStorage<GatewayContext>,
+  config: ChannelSchedulingConfig,
+) {
   const isConcurrencyLimitError = await loadCodeArtsConcurrencyClassifier()
   const reportAccount = await loadSchedulingLedger()
   const dispatch = new AsyncLocalStorage<any>()
@@ -37,7 +40,7 @@ export async function installCodeArtsScheduling(ctx: any, gateway: AsyncLocalSto
     assertCodeArtsSchedulingContract(adapter)
     const options = adapter.options
     const pool = options.accountPool
-    cooldowns = createModelCooldowns(pool, () => scheduler?.wake())
+    cooldowns = createModelCooldowns(pool, () => scheduler?.wake(), config)
     const queueError = () => new LlmError("CodeArts 当前账号的模型排队中，请稍后重试", "QUEUE", { status: 429 })
     scheduler = createAccountScheduler({
       config,
@@ -194,5 +197,6 @@ export async function installCodeArtsScheduling(ctx: any, gateway: AsyncLocalSto
     normalizeCooldowns: () => cooldowns.normalize(),
     clearCooldowns: (selection: Parameters<typeof cooldowns.clear>[0]) => cooldowns.clear(selection),
     stats: () => scheduler?.stats(),
+    wake: () => scheduler?.wake(),
   }
 }

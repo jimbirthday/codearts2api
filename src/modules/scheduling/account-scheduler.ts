@@ -174,6 +174,7 @@ export function createAccountScheduler({
     }
     const load = loads.get(picked.id) ?? { inFlight: 0, lastUsed: 0, sessions: new Set(), blockedUntil: 0 }
     const session = { accepted: false, expiresAt: Infinity, retainUntil: 0 }
+    const sessionTtlMs = config.sessionTtlMs
     load.sessions.add(session)
     // 检查与占用之间不 await，避免多个并发请求争抢同一个剩余名额。
     load.inFlight++
@@ -183,7 +184,7 @@ export function createAccountScheduler({
     return {
       entry: picked,
       acceptSession() {
-        if (!session.accepted) session.retainUntil = Date.now() + config.sessionTtlMs
+        if (!session.accepted) session.retainUntil = Date.now() + sessionTtlMs
         session.accepted = true
       },
       rejectSession() {
@@ -194,9 +195,9 @@ export function createAccountScheduler({
         released = true
         load.inFlight--
         // 实测名额至少保留到发出后约 60 秒，长流完成后无需再加完整窗口。
-        if (session.accepted && config.sessionTtlMs > 0) {
+        if (session.accepted && sessionTtlMs > 0) {
           session.expiresAt =
-            reason === "success" ? session.retainUntil : Math.max(session.retainUntil, Date.now() + config.sessionTtlMs)
+            reason === "success" ? session.retainUntil : Math.max(session.retainUntil, Date.now() + sessionTtlMs)
           if (session.expiresAt <= Date.now()) load.sessions.delete(session)
         } else load.sessions.delete(session)
         if (binding) {

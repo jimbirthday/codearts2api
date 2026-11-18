@@ -70,6 +70,7 @@ import { CARRIER_PATH, JET_HUB_PATH, rpcEnvelope } from "../core/upstream.ts"
 import { installCodeArtsScheduling } from "./codearts-scheduling.ts"
 import { installLoomyScheduling } from "./loomy-scheduling.ts"
 import { installGatewayContext, type GatewayContext } from "./gateway-context.ts"
+import { createSchedulingSettings } from "../modules/scheduling/scheduling-settings.service.ts"
 
 /** 凭据文档名（与官方实现一致）。 */
 const CREDENTIALS_FILENAME = ".credentials.yaml"
@@ -226,8 +227,12 @@ export async function createHost() {
     Number(process.env.DSH_OPENAI_GATEWAY_PORT?.trim() || 8326),
   )
   ctx.effect(() => detachGatewayContext, "gateway-scheduling-context")
-  const codeartsScheduling = await installCodeArtsScheduling(ctx, gatewayContext)
-  const loomyScheduling = await installLoomyScheduling(ctx, gatewayContext)
+  const schedulingSettings = await createSchedulingSettings({
+    home,
+    changed: (provider) => (provider === "codearts" ? codeartsScheduling : loomyScheduling).wake(),
+  })
+  const codeartsScheduling = await installCodeArtsScheduling(ctx, gatewayContext, schedulingSettings.configs.codearts)
+  const loomyScheduling = await installLoomyScheduling(ctx, gatewayContext, schedulingSettings.configs.loomy)
 
   // ⑤ 装载插件。返回的是 thenable 的 Fiber，await 即「apply 已完成」。
   //    此处不 try/catch：插件装不上就是致命错误，不该带着残缺状态继续服务。
@@ -263,6 +268,7 @@ export async function createHost() {
     home,
     codeartsScheduling,
     loomyScheduling,
+    schedulingSettings,
     /** 凭据文档路径（供 /healthz 自查）。 */
     credentialsFile: join(home, CREDENTIALS_FILENAME),
     /** 插件已注册的 HTTP 路由（`path → route`）。 */

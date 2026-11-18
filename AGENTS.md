@@ -97,6 +97,21 @@ TXT 每行 `手机号----32位十六进制 session token----userid`，多文件�
 通过上游 `backup.import` 的 merge 追加；官方凭据格式为 `{phone, access_token, userid}`，不伪造到期时间。
 测试夹具只用假凭据，真实账号测试结果见 `docs/loomy-scheduling-2026-11-19.md`。
 
+### 调度配置热更新
+
+`modules/scheduling/scheduling-settings.service.ts` 在启动时以环境变量生成两渠道初值，再加载
+`<home>/scheduling.json` 的字段覆盖；优先级为界面保存值 > 环境变量 > 程序默认值。
+保存先校验并原子写盘，再原地更新传给两个调度器的同一份配置对象并唤醒队列，不重建调度器，
+不清空在途或绑定。写盘失败不得改变运行配置，损坏配置必须明确阻止启动。
+提高容量立即尝试已有队列，降低容量等待已有在途自然减少；旧请求等待预算、旧绑定和冷却期限不追溯修改。
+每个已预留会话记录其当时保留窗口，不能在请求结束时套用新的窗口。
+CodeArts / Loomy 的随机模型冷却上下限可以热更新，Loomy 真实额度耗尽仍沿用上游次日零点规则。
+配置不是上游账号备份的一部分，迁移时单独保留 `scheduling.json`。
+
+`GET /admin/scheduling/api` 与 `PATCH /admin/scheduling/api/:provider` 挂管理鉴权，
+同时加入大小写不敏感的受保护前缀。前端 `channels/SchedulingSettings.tsx` 按需读取和分渠道编辑，
+保留数值范围、冷却上下限校验、保存忙态和错误反馈；开发 Vite 代理也须挂此路径。
+
 ### 管理界面装配
 
 前端是 `web/` 下的标准 Vite 应用：`main.tsx` 先装 `window.__ModuleLoader__.load` 垫片，再用
