@@ -36,7 +36,7 @@ function text(value: unknown, field: string, required = true): string | undefine
   return value.trim()
 }
 
-function normalize(value: unknown) {
+export function normalizeCodeArtsCredential(value: unknown) {
   const raw = object(value)
   const credential = {
     access_key_id: text(raw.access_key_id, "access_key_id")!,
@@ -112,7 +112,7 @@ export async function prepareCodeArtsImport(files: File[]): Promise<CodeArtsImpo
     for (const [index, record] of records.entries()) {
       const source = Array.isArray(parsed) ? `${file.name} · 第 ${index + 1} 条` : file.name
       try {
-        const { credential, expiresAt } = normalize(record)
+        const { credential, expiresAt } = normalizeCodeArtsCredential(record)
         const keys = [`ak:${credential.access_key_id}`]
         if (credential.user_id) keys.push(`user:${credential.user_id}`)
         if (keys.some((key) => identities.has(key))) {

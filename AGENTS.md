@@ -49,6 +49,10 @@
 `prepareCall().stream()` / `stream()` 接入宿主调度；选号过滤与凭据读取仍调用上游账号池，
 登录、签名、模型目录、推理协议与续期仍由上游实现。相关实例成员在
 `src/core/upstream.ts` 的 `assertCodeArtsSchedulingContract()` 启动核对，升级时必须跑调度集成测试。
+已分类的 SSE 排队信号（`SseQueueRetryError`）与 `queryQueueStatus()` 确认的排队会转换为
+`QUEUE`，通过上游 `updateModelRateLimit()` 冷却当前账号模型 10 秒并换号，不复制业务码解析。
+升级时同时核对 `consumeSse()`、`queryQueueStatus()` 与排队错误名称；输出后禁止内部重放。
+`LOG_LEVEL=debug` 的 `[codearts-scheduling]` 日志区分派发、获取名额、首个内容块与正文首字。
 
 `src/host/gateway-context.ts` 用 Node `http.server.request.start` 诊断事件为插件网关请求建立
 AsyncLocalStorage 上下文，保留上游原请求处理器和鉴权；依赖单个 `request` 监听器，契约漂移返回
@@ -478,6 +482,9 @@ addedNode / characterData / 端口越界 / 幂等）、「回调修复」交互�
 越界端口禁用、Esc 关闭、busy 时 Esc 不关）、日期下拉外部点击关闭、「查询」不吞点击、FormModal（Esc / 遮罩 / 首焦）、
 SecretModal（Esc 不关且 onClose 不被调用）、主题与自动刷新**存储 key 迁移**（c2→c2a）；以及 callers/overview 格式化纯逻辑测试；
 `caller-gate.test.ts` 覆盖用量日志耗时从请求进入时算起。
+**CodeArts JSON 导出**：前端用 `account.list` 选取 CodeArts ID，再调 `backup.export({accountIds})`，
+只转换凭据格式并下载，保留当前存储的续期材料；`web/utils/codearts-export.ts` 与导入复用校验。
+导出不强制续期；验证刷新后凭据和导入往返，缺失/损坏跳过且提示，不显示原始错误与凭据。
 **CodeArts 调度**：百请求并发在途上限、粘性等待与队列超时/取消、模型限额迁移、旧请求不覆盖新绑定、
 TTL、坏凭据回收，以及真实 HTTP Chat/Responses/聚合入口、SSE 完整生命周期、内部额度换号、
 实际账号续期、输出前失败重试与输出后禁止重放、调用方隔离（仅模拟外部供应商传输）。

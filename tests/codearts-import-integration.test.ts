@@ -1,7 +1,9 @@
 import assert from "node:assert/strict"
 import { stat } from "node:fs/promises"
 import { test } from "vite-plus/test"
+import { credentialRef } from "@deepseek-ai/dsh-credentials"
 
+import { exportCodeArtsAccounts } from "../web/utils/codearts-export"
 import { prepareCodeArtsImport } from "../web/utils/codearts-import"
 import { codeArtsJson, jsonFile } from "./fixtures/codearts-import"
 import { rpc, startTestApp } from "./helpers"
@@ -47,6 +49,18 @@ test("CodeArts JSON 经真实 RPC 导入：凭据可读、判重、不覆盖既�
   const repeated = await rpc(app.origin, "backup.import", { payload: batch.payload, mode: "merge" })
   assert.equal(repeated.value.accountsImported, 0)
   assert.equal(repeated.value.accountsSkipped.length, 3)
+
+  const current = JSON.parse(after.credentials[existingRef])
+  current.access_key_id = "TEST_AK_ROTATED"
+  current.refresh_token = "TEST_REFRESH_ROTATED"
+  await app.host.ctx.get("credentials").set(credentialRef(existingRef), JSON.stringify(current))
+  const selected = await rpc(app.origin, "backup.export", { accountIds: [existing.payload.accounts[0].id] })
+  const exported = exportCodeArtsAccounts(selected.value.payload)
+  assert.equal(exported.accounts.length, 1)
+  assert.equal(exported.accounts[0].access_key_id, "TEST_AK_ROTATED")
+  assert.equal(exported.accounts[0].refresh_token, "TEST_REFRESH_ROTATED")
+  const roundtrip = await prepareCodeArtsImport([jsonFile("export.json", exported.accounts)])
+  assert.equal(JSON.parse(Object.values(roundtrip.payload.credentials)[0]).refresh_token, "TEST_REFRESH_ROTATED")
 
   const unauthorized = await fetch(`${app.origin}/api/jet-hub`, {
     method: "POST",

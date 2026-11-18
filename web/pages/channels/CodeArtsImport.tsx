@@ -1,6 +1,7 @@
 import { useRef, useState } from "react"
 
 import { hostRpcCall } from "../../api/rpc"
+import { exportCodeArtsAccounts } from "../../utils/codearts-export"
 import { prepareCodeArtsImport, type CodeArtsImportBatch } from "../../utils/codearts-import"
 import styles from "./CodeArtsImport.module.less"
 
@@ -8,6 +9,7 @@ export function CodeArtsImport({ onImported }: { onImported: () => void }) {
   const inputRef = useRef<HTMLInputElement>(null)
   const [batch, setBatch] = useState<CodeArtsImportBatch | null>(null)
   const [busy, setBusy] = useState(false)
+  const [exporting, setExporting] = useState(false)
   const [notice, setNotice] = useState("")
   const [error, setError] = useState("")
 
@@ -48,13 +50,55 @@ export function CodeArtsImport({ onImported }: { onImported: () => void }) {
     }
   }
 
+  async function download() {
+    if (busy) return
+    setBusy(true)
+    setExporting(true)
+    setNotice("")
+    setError("")
+    try {
+      const listed = await hostRpcCall("account.list", { provider: "codearts" })
+      const accountIds = listed.accounts
+        .filter((account: any) => account.provider === "codearts")
+        .map((account: any) => account.id)
+      if (!accountIds.length) {
+        setError("没有可导出的 CodeArts 账号")
+        return
+      }
+      const result = await hostRpcCall("backup.export", { accountIds })
+      const { accounts, skipped } = exportCodeArtsAccounts(result.payload)
+      const blob = new Blob([JSON.stringify(accounts, null, 2)], { type: "application/json" })
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement("a")
+      link.href = url
+      link.download = `codearts-accounts-${new Date().toISOString().replace(/[:.]/g, "-")}.json`
+      document.body.append(link)
+      link.click()
+      link.remove()
+      setTimeout(() => URL.revokeObjectURL(url), 0)
+      const missing =
+        accountIds.length - result.payload.accounts.filter((account: any) => account.provider === "codearts").length
+      setNotice(
+        `已导出 ${accounts.length} 个账号${skipped + missing ? `；${skipped + missing} 个账号凭据不可用或已删除，未导出` : ""}`,
+      )
+    } catch {
+      setError("导出未完成，请检查网络、登录和账号凭据状态后重试")
+    } finally {
+      setBusy(false)
+      setExporting(false)
+    }
+  }
+
   const count = batch?.payload.accounts.length ?? 0
   const rows = batch?.rows ?? []
   return (
-    <section className={styles.importer} aria-label="CodeArts JSON 导入" aria-busy={busy}>
+    <section className={styles.importer} aria-label="CodeArts JSON 导入与导出" aria-busy={busy}>
       <div className={styles.toolbar}>
         <button type="button" className="c2a-btn" disabled={busy} onClick={() => inputRef.current?.click()}>
-          {busy ? "处理中…" : "导入 CodeArts JSON"}
+          {busy && !exporting ? "处理中…" : "导入 CodeArts JSON"}
+        </button>
+        <button type="button" className="c2a-btn" disabled={busy} onClick={download}>
+          {exporting ? "导出中…" : "导出 CodeArts JSON"}
         </button>
         <input
           ref={inputRef}
@@ -70,7 +114,7 @@ export function CodeArtsImport({ onImported }: { onImported: () => void }) {
           }}
         />
         <span className={styles.hint}>
-          支持单个或多个文件，每个文件可为账号对象或数组；每批最多 100 个文件 / 2 MB。
+          导入支持单个或多个文件，每批最多 100 个文件 / 2 MB；导出包含当前账号密钥与续期材料。
         </span>
       </div>
       {batch ? (

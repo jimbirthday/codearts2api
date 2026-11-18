@@ -41,12 +41,14 @@ export function assertCodeArtsSchedulingContract(adapter: any) {
   const pool = adapter?.options?.accountPool
   if (
     !pool ||
-    !["candidateAccounts", "resolveFirstCredential", "getAvailableAccount"].every(
+    !["candidateAccounts", "resolveFirstCredential", "getAvailableAccount", "updateModelRateLimit"].every(
       (name) => typeof pool[name] === "function",
     ) ||
     typeof adapter.options.resolveCredential !== "function" ||
     typeof adapter.options.refresh !== "function" ||
     typeof adapter.prepareCall !== "function" ||
+    typeof adapter.consumeSse !== "function" ||
+    typeof adapter.queryQueueStatus !== "function" ||
     !["chatId", "sessionId"].every(
       (name) => typeof adapter[name] === "string" && Object.getOwnPropertyDescriptor(adapter, name)?.configurable,
     )

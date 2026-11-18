@@ -39,11 +39,12 @@ async function setup(t: any, count = 2, config: Record<string, string> = {}, opt
   const calls: Array<{ account: string; chat: string; session: string }> = []
   let answer = async (_url: string, _init: any): Promise<Response> => completion()
   adapter.fetchImpl = (url: string, init: any) => {
-    assert.match(url, /chat\/completions$/)
+    assert.match(url, /chat\/completions$|queue\/status\?/)
     const headers = new Headers(init.headers)
     const account = /Access=([^,\s]+)/.exec(headers.get("authorization")!)?.[1] ?? ""
     assert.ok(account)
-    calls.push({ account, chat: headers.get("chat-id")!, session: headers.get("session-id")! })
+    if (url.endsWith("/chat/completions"))
+      calls.push({ account, chat: headers.get("chat-id")!, session: headers.get("session-id")! })
     return answer(url, init)
   }
   const send = (session: string, extra: any = {}, origin = app.origin, path = "/v1/chat/completions") => {
@@ -190,6 +191,110 @@ test("内部模型额度换号经过同一租约，后续会话粘住最终成�
   const listed = await rpc(env.app.origin, "account.list", { provider: "codearts" })
   assert.ok(listed.value.accounts.some((account: any) => account.modelRateLimits?.[MODEL] > Date.now()))
   assert.equal(env.app.host.codeartsScheduling.stats().inFlight, 0)
+})
+
+for (const kind of ["SSE", "HTTP"]) {
+  test(`${kind} 上游排队立即换号，不持有租约等待 10 秒重试`, async (t) => {
+    const env = await setup(t)
+    env.setAnswer(async (url) => {
+      if (url.includes("/queue/status")) return Response.json({ status: "waiting", queue_position: 2 })
+      if (env.calls.length !== 1) return completion()
+      return kind === "SSE"
+        ? new Response('data: {"error_code":"InferHub.ModelArts.81111.429","error_msg":"busy"}\n\n', {
+            headers: { "content-type": "text/event-stream" },
+          })
+        : Response.json({ error_code: "TM.00001041" }, { status: 400 })
+    })
+    const response = await env.send("queued", { signal: AbortSignal.timeout(1500) })
+    assert.equal(response.status, 200, JSON.stringify(await response.json()))
+    assert.equal(env.calls.length, 2)
+    assert.notEqual(env.calls[0].account, env.calls[1].account)
+    const pool = env.app.host.ctx.get("accountPool")
+    assert.equal(pool.candidateAccounts("codearts", MODEL, new Set()).length, 1)
+    assert.equal(pool.candidateAccounts("codearts", "other-model", new Set()).length, 2)
+    assert.equal(env.app.host.codeartsScheduling.stats().inFlight, 0)
+    const later = await env.send("queued")
+    assert.equal(later.status, 200, JSON.stringify(await later.json()))
+    assert.equal(env.calls[1].account, env.calls[2].account)
+  })
+}
+
+test("全部账号上游排队时快速返回 429，不在同号反复等待", async (t) => {
+  const env = await setup(t)
+  env.setAnswer(
+    async () =>
+      new Response('data: {"error_code":"InferHub.ModelArts.81111.429","error_msg":"busy"}\n\n', {
+        headers: { "content-type": "text/event-stream" },
+      }),
+  )
+  const response = await env.send("all-busy", { signal: AbortSignal.timeout(1500) })
+  assert.equal(response.status, 429)
+  assert.equal((await response.json()).error.code, "QUEUE")
+  assert.equal(env.calls.length, 2)
+  assert.equal(env.app.host.codeartsScheduling.stats().inFlight, 0)
+})
+
+for (const code of ["InferHub.ModelArts.81111.429", "InferHub.4291.200"]) {
+  test(`输出后遇到 ${code} 也不允许适配器内部重放`, async (t) => {
+    const env = await setup(t)
+    env.setAnswer(
+      async () =>
+        new Response(delta("PARTIAL") + `data: ${JSON.stringify({ error_code: code, error_msg: "limited" })}\n\n`, {
+          headers: { "content-type": "text/event-stream" },
+        }),
+    )
+    const response = await env.send("partial", { stream: true, signal: AbortSignal.timeout(1500) })
+    const body = await response.text()
+    assert.match(body, /PARTIAL/)
+    assert.match(body, /error/)
+    assert.equal(env.calls.length, 1)
+    assert.equal(env.app.host.codeartsScheduling.stats().inFlight, 0)
+  })
+}
+
+test("诊断区分首个推理块与最终正文补出，不记录提示词或凭据", async (t) => {
+  const env = await setup(t)
+  const log = vi.spyOn(env.app.host.ctx.logger, "debug")
+  t.onTestFinished(() => log.mockRestore())
+  env.setAnswer(
+    async () =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(
+              encoder.encode(
+                `data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: "thinking-only" } }] })}\n\n`,
+              ),
+            )
+            setTimeout(() => {
+              controller.enqueue(encoder.encode(end))
+              controller.close()
+            }, 80)
+          },
+        }),
+        { headers: { "content-type": "text/event-stream" } },
+      ),
+  )
+  const response = await env.send(
+    "timing",
+    { stream: true, input: "private-prompt", messages: undefined },
+    env.app.origin,
+    "/v1/responses",
+  )
+  const body = await response.text()
+  assert.match(body, /response.reasoning_summary_text.delta/)
+  assert.match(body, /response.output_text.done/)
+  const message = log.mock.calls
+    .map((args) => String(args[0]))
+    .find((value) => value.startsWith("[codearts-scheduling] "))!
+  assert.ok(message)
+  const timing = JSON.parse(message.slice("[codearts-scheduling] ".length))
+  assert.ok(timing.firstTextMs - timing.firstChunkMs >= 50)
+  assert.ok(timing.totalMs >= timing.firstTextMs)
+  assert.equal(timing.attempts, 1)
+  assert.equal(timing.result, "success")
+  assert.doesNotMatch(message, /private-prompt|thinking-only|TEST_AK|TEST_SK/)
+  assert.ok(timing.accounts.every((id: string) => /^[a-f0-9]{12}$/.test(id)))
 })
 
 test("真实 SSE 粘性：绑定号忙时等待，其他会话仍能使用空闲账号", async (t) => {

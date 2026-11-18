@@ -6,6 +6,7 @@ import { schedulingSessionKey } from "../modules/scheduling/session-key.ts"
 
 export interface GatewayContext {
   sessionKey?: string
+  started: number
 }
 
 /** 在 Node 的请求入口建立异步上下文，兼容代理入口与直接访问插件网关。 */
@@ -31,7 +32,10 @@ export function installGatewayContext(storage: AsyncLocalStorage<GatewayContext>
         original.call(server, request, response)
         return
       }
-      const context: GatewayContext = { sessionKey: schedulingSessionKey(undefined, request.headers) }
+      const context: GatewayContext = {
+        sessionKey: schedulingSessionKey(undefined, request.headers),
+        started: performance.now(),
+      }
       let chunks: Buffer[] = []
       let size = 0
       let discarded = false
