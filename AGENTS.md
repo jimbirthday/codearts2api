@@ -51,7 +51,11 @@
 `src/core/upstream.ts` 的 `assertCodeArtsSchedulingContract()` 启动核对，升级时必须跑调度集成测试。
 已分类的 SSE 排队信号（`SseQueueRetryError`）与 `queryQueueStatus()` 确认的排队会转换为
 `QUEUE`，通过上游 `updateModelRateLimit()` 冷却当前账号模型 10 秒并换号，不复制业务码解析。
-升级时同时核对 `consumeSse()`、`queryQueueStatus()` 与排队错误名称；输出后禁止内部重放。
+升级时同时核对 `consumeSse()`、`queryQueueStatus()`、可替换的 `fetchImpl` 与排队错误名称；输出后禁止内部重放。
+HTTP 400/403 的并发错误在传输边界交回调度，不依赖可能误报 `working` 的队列接口。
+唯一的模块路径例外是 `src/core/upstream.ts` 按插件入口相邻路径载入 `lib/llm-adapter.js` 的
+`isConcurrencyLimitError()` 纯函数；包根没有重导出它，故显式记录版本契约并在启动核对函数形状。
+此处复用原判据，不复制业务码解析，也不修改依赖文件。
 `LOG_LEVEL=debug` 的 `[codearts-scheduling]` 日志区分派发、获取名额、首个内容块与正文首字。
 
 `src/host/gateway-context.ts` 用 Node `http.server.request.start` 诊断事件为插件网关请求建立

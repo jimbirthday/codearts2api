@@ -3,7 +3,7 @@ import { createHash, randomUUID } from "node:crypto"
 import { LlmError } from "@deepseek-ai/dsh-llm"
 
 import { resolveCodeArtsScheduling } from "../config/env.ts"
-import { assertCodeArtsSchedulingContract } from "../core/upstream.ts"
+import { assertCodeArtsSchedulingContract, loadCodeArtsConcurrencyClassifier } from "../core/upstream.ts"
 import { createAccountScheduler } from "../modules/scheduling/account-scheduler.ts"
 import { installGatewayContext, type GatewayContext } from "./gateway-context.ts"
 
@@ -24,8 +24,9 @@ const ACCOUNT_FAILURES = new Set([
 const accountFailure = (error: any) =>
   error instanceof LlmError ? ACCOUNT_FAILURES.has(error.code) : error?.name !== "AbortError"
 
-export function installCodeArtsScheduling(ctx: any) {
+export async function installCodeArtsScheduling(ctx: any) {
   const config = resolveCodeArtsScheduling()
+  const isConcurrencyLimitError = await loadCodeArtsConcurrencyClassifier()
   const gateway = new AsyncLocalStorage<GatewayContext>()
   const dispatch = new AsyncLocalStorage<any>()
   const detach = installGatewayContext(gateway, Number(process.env.DSH_OPENAI_GATEWAY_PORT?.trim() || 8326))
@@ -38,9 +39,24 @@ export function installCodeArtsScheduling(ctx: any) {
     assertCodeArtsSchedulingContract(adapter)
     const options = adapter.options
     const pool = options.accountPool
+    const queueCooldowns = new Map<string, number>()
+    const queueError = () => new LlmError("CodeArts 当前账号的模型排队中，请稍后重试", "QUEUE", { status: 429 })
     scheduler = createAccountScheduler({
       config,
-      candidates: (model, excluded) => pool.candidateAccounts("codearts", model, excluded),
+      candidates: (model, excluded) => {
+        const now = Date.now()
+        for (const [key, until] of queueCooldowns) if (until <= now) queueCooldowns.delete(key)
+        const available = pool.candidateAccounts("codearts", model, excluded)
+        if (
+          !available.length &&
+          pool
+            .candidateAccounts("codearts", "", excluded)
+            .some((entry: any) => queueCooldowns.has(`${entry.id}\0${model}`))
+        ) {
+          throw queueError()
+        }
+        return available
+      },
       resolve: (entry) => pool.resolveFirstCredential("codearts", [entry]),
     })
     const choose = async (state: any, excluded = state.excluded) => {
@@ -64,10 +80,34 @@ export function installCodeArtsScheduling(ctx: any) {
     const rejectQueue = async (state: any) => {
       if (state.lease) {
         // 复用上游的模型限流表，避免新会话不断撞回同一个排队账号。
-        await pool.updateModelRateLimit(state.lease.entry.id, state.model, Date.now() + 10_000)
+        const until = Date.now() + 10_000
+        queueCooldowns.set(`${state.lease.entry.id}\0${state.model}`, until)
+        await pool.updateModelRateLimit(state.lease.entry.id, state.model, until)
       }
-      throw new LlmError("CodeArts 当前账号的模型排队中，请稍后重试", "QUEUE", { status: 429 })
+      throw queueError()
     }
+    const wrapFetch = (transport: any) =>
+      async function (this: any, ...args: any[]) {
+        const response = await transport.apply(this, args)
+        const state = dispatch.getStore()
+        if (state && [400, 403].includes(response.status)) {
+          const body = await response.clone().text()
+          // TM.00001041 可与 queue/status=working 同时出现，不能依赖队列状态判定。
+          if (isConcurrencyLimitError(body)) {
+            await response.body?.cancel().catch(() => {})
+            await rejectQueue(state)
+          }
+        }
+        return response
+      }
+    let fetchImpl = wrapFetch(adapter.fetchImpl)
+    Object.defineProperty(adapter, "fetchImpl", {
+      configurable: true,
+      get: () => fetchImpl,
+      set: (value) => {
+        fetchImpl = wrapFetch(value)
+      },
+    })
     const consumeSse = adapter.consumeSse
     adapter.consumeSse = async function* (...args: any[]) {
       try {

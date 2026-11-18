@@ -217,7 +217,7 @@ export async function createHost() {
 
   // ④ llm：真实的 LLM 运行时。必须在 ctx.plugin 之前构造（它自己 provide）。
   new LlmRuntime(ctx)
-  const codeartsScheduling = installCodeArtsScheduling(ctx)
+  const codeartsScheduling = await installCodeArtsScheduling(ctx)
 
   // ⑤ 装载插件。返回的是 thenable 的 Fiber，await 即「apply 已完成」。
   //    此处不 try/catch：插件装不上就是致命错误，不该带着残缺状态继续服务。

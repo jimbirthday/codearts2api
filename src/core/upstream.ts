@@ -22,6 +22,7 @@
  * | 网关绑 `127.0.0.1` | `openai-gateway/config.ts` | 容器必须走反代 |
  * | CodeArts 账号池、适配器 options / prepareCall / 会话字段 | `assertCodeArtsSchedulingContract` | 启动失败，核对宿主调度钩子 |
  * | 网关单个 request 监听器 | `host/gateway-context.ts` | 返回可读 503，核对请求入口 |
+ * | `lib/llm-adapter.js` 的并发错误分类函数 | `loadCodeArtsConcurrencyClassifier` | 启动失败，核对版本契约 |
  */
 
 /** Jet Hub 管理端点路径（上游 `JET_HUB_API_PATH`）。 */
@@ -36,7 +37,18 @@ export const JET_HUB_ENDPOINT = "jet-hub"
 /** 客户端 bundle 会注册的 slot 名（我们据此把页面组件捞出来）。 */
 export const SETTINGS_SECTION_SLOT = "settings.section"
 
-/** 宿主调度只接这些实例成员；不导入或复制上游内部模块。 */
+/** 包根未重导出该纯函数；按固定版本的相邻模块加载，避免复制业务码解析。 */
+export async function loadCodeArtsConcurrencyClassifier(): Promise<(body: string) => boolean> {
+  const { isConcurrencyLimitError } = await import(
+    new URL("./llm-adapter.js", import.meta.resolve("dsh-providers-hub")).href
+  )
+  if (typeof isConcurrencyLimitError !== "function") {
+    throw new Error("CodeArts 并发错误分类契约已变化，请核对 src/core/upstream.ts")
+  }
+  return isConcurrencyLimitError
+}
+
+/** 宿主调度只接这些实例成员；协议和凭据实现仍由上游负责。 */
 export function assertCodeArtsSchedulingContract(adapter: any) {
   const pool = adapter?.options?.accountPool
   if (
@@ -49,6 +61,8 @@ export function assertCodeArtsSchedulingContract(adapter: any) {
     typeof adapter.prepareCall !== "function" ||
     typeof adapter.consumeSse !== "function" ||
     typeof adapter.queryQueueStatus !== "function" ||
+    typeof adapter.fetchImpl !== "function" ||
+    !Object.getOwnPropertyDescriptor(adapter, "fetchImpl")?.configurable ||
     !["chatId", "sessionId"].every(
       (name) => typeof adapter[name] === "string" && Object.getOwnPropertyDescriptor(adapter, name)?.configurable,
     )

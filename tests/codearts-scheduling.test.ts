@@ -232,6 +232,47 @@ test("全部账号上游排队时快速返回 429，不在同号反复等待", a
   assert.equal((await response.json()).error.code, "QUEUE")
   assert.equal(env.calls.length, 2)
   assert.equal(env.app.host.codeartsScheduling.stats().inFlight, 0)
+  const later = await env.send("cooldown")
+  assert.equal(later.status, 429)
+  assert.equal((await later.json()).error.code, "QUEUE")
+  assert.equal(env.calls.length, 2, "冷却期间不能重新打到上游，也不能误报凭据缺失")
+})
+
+test("真实 400 TM.00001041 即使队列报告 working 也立即换号", async (t) => {
+  const env = await setup(t)
+  let probes = 0
+  env.setAnswer(async (url) => {
+    if (url.includes("/queue/status")) {
+      probes++
+      return Response.json({ status: "working", queue_position: 0 })
+    }
+    return env.calls.length === 1
+      ? Response.json(
+          { error_code: "TM.00001041", error_msg: "并发会话数已达上限(3个)，请关闭部分会话后重试。" },
+          { status: 400 },
+        )
+      : completion()
+  })
+  const response = await env.send("real-limit", { signal: AbortSignal.timeout(1500) })
+  assert.equal(response.status, 200, JSON.stringify(await response.json()))
+  assert.equal(env.calls.length, 2)
+  assert.notEqual(env.calls[0].account, env.calls[1].account)
+  assert.equal(probes, 0)
+  assert.equal(env.app.host.codeartsScheduling.stats().inFlight, 0)
+})
+
+test("普通 400 参数错误保留上游处理，不换号、不惩罚账号", async (t) => {
+  const env = await setup(t)
+  env.setAnswer(async (url) =>
+    url.includes("/queue/status")
+      ? Response.json({ status: "working", queue_position: 0 })
+      : Response.json({ error_code: "INVALID_REQUEST", error_msg: "invalid parameter" }, { status: 400 }),
+  )
+  const response = await env.send("invalid")
+  assert.notEqual(response.status, 200)
+  assert.equal((await response.json()).error.code, "INVALID_REQUEST")
+  assert.equal(env.calls.length, 1)
+  assert.equal(env.app.host.ctx.get("accountPool").candidateAccounts("codearts", MODEL, new Set()).length, 2)
 })
 
 for (const code of ["InferHub.ModelArts.81111.429", "InferHub.4291.200"]) {
