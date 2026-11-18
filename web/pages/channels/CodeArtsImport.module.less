@@ -1,0 +1,49 @@
+.importer {
+  flex: none;
+  padding: 12px 24px;
+  border-bottom: 1px solid var(--c2a-border);
+  background: var(--c2a-surface);
+  font-size: 13px;
+  line-height: 1.6;
+
+  p {
+    margin: 8px 0;
+  }
+
+  [role="alert"],
+  [data-status="invalid"] {
+    color: var(--c2a-err);
+  }
+}
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+
+  button {
+    min-height: 44px;
+  }
+}
+
+.hint {
+  color: var(--c2a-text-2);
+}
+
+.preview {
+  max-height: 40dvh;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+}
+
+.rows {
+  margin: 8px 0;
+  padding-left: 20px;
+}
+
+@media (max-width: 600px) {
+  .importer {
+    padding: 10px 16px;
+  }
+}

@@ -7,7 +7,14 @@
 ---
 
 <details open>
-<summary><b>2026-11-18 · 上游升级 <code>d393816</code>（自动升级）</b></summary>
+<summary><b>2026-11-18 · CodeArts JSON 批量导入与上游升级 <code>d393816</code></b></summary>
+
+### CodeArts JSON 批量导入
+
+- 渠道管理增加单个/多个 JSON 文件导入，兼容单账号对象与账号数组；先校验预览，再确认追加。
+- 转换 `cloud_dragon_token`、`expiration`、`dpop_private_key` 到上游凭据字段，保留自动续期材料。
+- 复用 `backup.import` 的 `merge` 模式，跳过重复账号，保持现有凭据、模型开关和锁定设置。
+- 增加转换、文件错误、UI 确认与重试，以及真实宿主导入和凭据权限的测试。
 
 ## 上游升级
 
