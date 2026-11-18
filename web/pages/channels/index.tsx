@@ -2,7 +2,7 @@ import { useEffect, useState } from "react"
 
 import { hostRpcCall } from "../../api/rpc"
 import { ensureUpstreamPage } from "../../api/upstream"
-import { CodeArtsImport } from "./CodeArtsImport"
+import { AccountImport } from "./AccountImport"
 import { MobileProviderPicker } from "./MobileProviderPicker"
 import { ModelsPanelHost } from "./ModelsPanelHost"
 
@@ -33,7 +33,8 @@ export default function ChannelsPage() {
   const [revision, setRevision] = useState(0)
   return (
     <div className="c2a-view" id="admin-root" data-view="channels" role="tabpanel" aria-label="渠道管理">
-      <CodeArtsImport onImported={() => setRevision((value) => value + 1)} />
+      <AccountImport onImported={() => setRevision((value) => value + 1)} />
+      <AccountImport provider="loomy" onImported={() => setRevision((value) => value + 1)} />
       <ChannelsView revision={revision} />
       <MobileProviderPicker />
       <ModelsPanelHost />

@@ -112,7 +112,8 @@ export async function createHttpServer(host, options: any = {}) {
   const modelsService = createModelsService({
     rpc: (method, payload) => adminRpc(method, payload, "models"),
     logger,
-    clearCooldowns: host.codeartsScheduling?.clearCooldowns,
+    clearCooldowns: (provider, selection) =>
+      host[provider === "loomy" ? "loomyScheduling" : "codeartsScheduling"].clearCooldowns(selection),
   })
   const modelsAdmin = createModelsController({ service: modelsService })
 
@@ -150,7 +151,7 @@ export async function createHttpServer(host, options: any = {}) {
         proxyGateway,
         adminAuth: adminKeyEnabled(),
         gateway,
-        scheduling: { codearts: host.codeartsScheduling?.stats() },
+        scheduling: { codearts: host.codeartsScheduling?.stats(), loomy: host.loomyScheduling?.stats() },
       })
     }),
   )

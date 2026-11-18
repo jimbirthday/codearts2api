@@ -32,10 +32,14 @@ export function createAccountScheduler({
   candidates,
   resolve,
   config,
+  label = "CodeArts",
+  priority = () => 0,
 }: {
   candidates: (model: string, excluded: Set<string>) => any[]
   resolve: (entry: any) => Promise<any>
   config: SchedulingConfig
+  label?: string
+  priority?: (entry: any) => number
 }) {
   const loads = new Map<
     string,
@@ -53,7 +57,7 @@ export function createAccountScheduler({
   let closed = false
   let pumping = false
   const busy = () =>
-    new LlmError("CodeArts 账号繁忙，等待名额超时或队列已满，请稍后重试", "RATE_LIMIT", { status: 429 })
+    new LlmError(`${label} 账号繁忙，等待名额超时或队列已满，请稍后重试`, "RATE_LIMIT", { status: 429 })
 
   function sessionFull(id: string) {
     const load = loads.get(id)
@@ -93,7 +97,7 @@ export function createAccountScheduler({
   }
 
   function reserve(selection: Selection) {
-    if (closed) throw new LlmError("CodeArts 调度器正在关闭", "ABORTED", { status: 503 })
+    if (closed) throw new LlmError(`${label} 调度器正在关闭`, "ABORTED", { status: 503 })
     selection.signal?.throwIfAborted()
     const available = candidates(selection.model, selection.excluded)
     const key = selection.sessionKey
@@ -106,11 +110,11 @@ export function createAccountScheduler({
       binding = undefined
     }
     if (!available.length)
-      throw new LlmError("当前模型没有可用的 CodeArts 账号，请检查账号启用状态、凭据和模型限额", "MISSING_CREDENTIAL", {
+      throw new LlmError(`当前模型没有可用的 ${label} 账号，请检查账号启用状态、凭据和模型限额`, "MISSING_CREDENTIAL", {
         status: 503,
       })
     if (available.every((entry) => (loads.get(entry.id)?.blockedUntil ?? 0) > Date.now()))
-      throw new LlmError("CodeArts 候选账号的会话名额均已满，请稍后重试", "QUEUE", { status: 429 })
+      throw new LlmError(`${label} 候选账号的会话名额均已满，请稍后重试`, "QUEUE", { status: 429 })
 
     if (
       binding &&
@@ -131,9 +135,16 @@ export function createAccountScheduler({
         picked = entry
         continue
       }
-      const left = [load?.inFlight ?? 0, load?.sessions.size ?? 0, boundCounts.get(entry.id) ?? 0, load?.lastUsed ?? 0]
+      const left = [
+        priority(entry),
+        load?.inFlight ?? 0,
+        load?.sessions.size ?? 0,
+        boundCounts.get(entry.id) ?? 0,
+        load?.lastUsed ?? 0,
+      ]
       const rightLoad = loads.get(picked.id)
       const right = [
+        priority(picked),
         rightLoad?.inFlight ?? 0,
         rightLoad?.sessions.size ?? 0,
         boundCounts.get(picked.id) ?? 0,
@@ -239,7 +250,7 @@ export function createAccountScheduler({
       )
       if (earliest > Date.now() + waitMs)
         throw new LlmError(
-          `CodeArts 会话名额尚未释放，预计 ${Math.ceil((earliest - Date.now()) / 1000)} 秒后可重试`,
+          `${label} 会话名额尚未释放，预计 ${Math.ceil((earliest - Date.now()) / 1000)} 秒后可重试`,
           "RATE_LIMIT",
           { status: 429 },
         )

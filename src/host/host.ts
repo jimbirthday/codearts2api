@@ -59,6 +59,7 @@ import AttachmentLocal from "@deepseek-ai/dsh-attachment-local"
 import LocalCredentialProvider from "@deepseek-ai/dsh-credentials-local"
 import LlmRuntime from "@deepseek-ai/dsh-llm"
 import { connect } from "node:net"
+import { AsyncLocalStorage } from "node:async_hooks"
 import { join } from "node:path"
 import * as plugin from "dsh-providers-hub"
 
@@ -67,6 +68,8 @@ import { pinHome } from "../core/home.ts"
 import { installLogger } from "../core/logger.ts"
 import { CARRIER_PATH, JET_HUB_PATH, rpcEnvelope } from "../core/upstream.ts"
 import { installCodeArtsScheduling } from "./codearts-scheduling.ts"
+import { installLoomyScheduling } from "./loomy-scheduling.ts"
+import { installGatewayContext, type GatewayContext } from "./gateway-context.ts"
 
 /** 凭据文档名（与官方实现一致）。 */
 const CREDENTIALS_FILENAME = ".credentials.yaml"
@@ -217,12 +220,20 @@ export async function createHost() {
 
   // ④ llm：真实的 LLM 运行时。必须在 ctx.plugin 之前构造（它自己 provide）。
   new LlmRuntime(ctx)
-  const codeartsScheduling = await installCodeArtsScheduling(ctx)
+  const gatewayContext = new AsyncLocalStorage<GatewayContext>()
+  const detachGatewayContext = installGatewayContext(
+    gatewayContext,
+    Number(process.env.DSH_OPENAI_GATEWAY_PORT?.trim() || 8326),
+  )
+  ctx.effect(() => detachGatewayContext, "gateway-scheduling-context")
+  const codeartsScheduling = await installCodeArtsScheduling(ctx, gatewayContext)
+  const loomyScheduling = await installLoomyScheduling(ctx, gatewayContext)
 
   // ⑤ 装载插件。返回的是 thenable 的 Fiber，await 即「apply 已完成」。
   //    此处不 try/catch：插件装不上就是致命错误，不该带着残缺状态继续服务。
   const fiber = await ctx.plugin(plugin)
   codeartsScheduling.assertReady()
+  loomyScheduling.assertReady()
   await codeartsScheduling.normalizeCooldowns()
 
   // ⑥ 核对上游契约 —— **启动即失败，而不是等用户点到某个按钮才 404**。
@@ -251,6 +262,7 @@ export async function createHost() {
     ctx,
     home,
     codeartsScheduling,
+    loomyScheduling,
     /** 凭据文档路径（供 /healthz 自查）。 */
     credentialsFile: join(home, CREDENTIALS_FILENAME),
     /** 插件已注册的 HTTP 路由（`path → route`）。 */

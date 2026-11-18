@@ -101,6 +101,13 @@ test("真实 Chat/Responses/直连网关：会话固定账号与 Chat-Id，每�
   assert.notEqual(env.calls[0].session, env.calls[3].session)
   assert.notEqual(env.calls[0].chat, env.calls[1].chat)
   assert.equal(env.app.host.codeartsScheduling.stats().inFlight, 0)
+  const ledger = (await rpc(env.app.origin, "usage.tokenLedger")).value.snapshot.entries
+  assert.equal(ledger.length, 4)
+  assert.ok(
+    ledger.every((entry: any) =>
+      env.batch.payload.accounts.some((account) => account.id.slice(0, 64) === entry.accountId),
+    ),
+  )
 })
 
 test("默认 HTTP 并发：20 个请求在两账号上运行，每号最大在途为 3", async (t) => {

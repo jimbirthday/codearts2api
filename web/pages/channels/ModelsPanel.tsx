@@ -146,13 +146,13 @@ export function ModelsPanel() {
   const allVisibleSelected = coolingRows.length > 0 && coolingRows.every((model: any) => selected[model.id])
 
   const clearCooldowns = async (all: boolean) => {
-    if (clearing || provider.id !== "codearts" || (!all && !selectedIds.length)) return
+    if (clearing || !["codearts", "loomy"].includes(provider.id) || (!all && !selectedIds.length)) return
     const id = provider.id
     setClearing(true)
     setNotice("")
     setErr(null)
     try {
-      const result = await request("/codearts/cooldowns/clear", {
+      const result = await request(`/${id}/cooldowns/clear`, {
         method: "POST",
         body: JSON.stringify(all ? { all: true } : { modelIds: selectedIds }),
       })
@@ -244,7 +244,7 @@ export function ModelsPanel() {
       </div>
       {open ? (
         <>
-          {provider.id === "codearts" ? (
+          {["codearts", "loomy"].includes(provider.id) ? (
             <div className={styles.actions} aria-busy={clearing}>
               <label className={styles.select}>
                 <input
@@ -322,7 +322,7 @@ export function ModelsPanel() {
                   m.enabledAccounts > 0 ? m.usableAccounts + "/" + m.enabledAccounts + " 号可用" : "无账号"
                 return (
                   <div key={m.id} className={styles.mrow} data-state={m.state} data-model={m.id}>
-                    {provider.id === "codearts" ? (
+                    {["codearts", "loomy"].includes(provider.id) ? (
                       <label className={styles.select}>
                         <input
                           type="checkbox"

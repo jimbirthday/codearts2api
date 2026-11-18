@@ -23,6 +23,8 @@
  * | CodeArts 账号池、适配器 options / prepareCall / 会话字段 | `assertCodeArtsSchedulingContract` | 启动失败，核对宿主调度钩子 |
  * | 网关单个 request 监听器 | `host/gateway-context.ts` | 返回可读 503，核对请求入口 |
  * | `lib/llm-adapter.js` 的并发错误分类函数 | `loadCodeArtsConcurrencyClassifier` | 启动失败，核对版本契约 |
+ * | Loomy 的协议、失败分类与余额缓存模块 | `loadLoomyScheduling` | 启动失败，核对版本契约 |
+ * | 两渠道实际账号的账本回报 | `loadSchedulingLedger` | 启动失败，核对记账入口 |
  */
 
 /** Jet Hub 管理端点路径（上游 `JET_HUB_API_PATH`）。 */
@@ -46,6 +48,58 @@ export async function loadCodeArtsConcurrencyClassifier(): Promise<(body: string
     throw new Error("CodeArts 并发错误分类契约已变化，请核对 src/core/upstream.ts")
   }
   return isConcurrencyLimitError
+}
+
+/** 调度更换选号入口后仍须向上游账本回报实际账号。 */
+export async function loadSchedulingLedger(): Promise<(provider: string, accountId: string) => void> {
+  const { reportLedgerAccount } = await import(
+    new URL("./token-ledger.js", import.meta.resolve("dsh-providers-hub")).href
+  )
+  if (typeof reportLedgerAccount !== "function") throw new Error("上游账号记账契约已变化，请核对 src/core/upstream.ts")
+  return reportLedgerAccount
+}
+
+/** Loomy 的协议、余额与失败分类继续复用锁定版本的上游模块。 */
+export async function loadLoomyScheduling() {
+  const base = import.meta.resolve("dsh-providers-hub")
+  const [adapter, credits, ranks, runtime, protocol] = await Promise.all([
+    import(new URL("./loomy-adapter.js", base).href),
+    import(new URL("./loomy-credits.js", base).href),
+    import(new URL("./loomy-balance-rank.js", base).href),
+    import(new URL("./provider-runtime.js", base).href),
+    import(new URL("./loomy.js", base).href),
+  ])
+  const result = {
+    classify: adapter.classifyLoomyFailure,
+    quotaResetAt: adapter.loomyCooldownResetAtMs,
+    fetchBalance: credits.fetchLoomyCreditDetail,
+    tier: ranks.loomyBalanceTier,
+    tierUsable: ranks.loomyTierUsable,
+    balanceCache: runtime.balanceCacheOf,
+    envelope: protocol.parseLoomyEnvelope,
+  }
+  if (Object.values(result).some((value) => typeof value !== "function"))
+    throw new Error("Loomy 调度契约已变化，请核对 src/core/upstream.ts")
+  return result
+}
+
+export function assertLoomySchedulingContract(adapter: any) {
+  if (
+    !adapter?.product?.apiBase ||
+    !["prepareCall", "stream", "fetchImpl"].every((name) => typeof adapter[name] === "function") ||
+    ![
+      "candidateAccounts",
+      "resolveFirstCredential",
+      "getAvailableAccount",
+      "updateModelRateLimit",
+      "permanentLocked",
+      "findAccount",
+      "strictManualOrder",
+    ].every((name) => typeof adapter.options?.accountPool?.[name] === "function") ||
+    !["resolveCredential", "refresh"].every((name) => typeof adapter.options?.[name] === "function") ||
+    !Object.getOwnPropertyDescriptor(adapter, "fetchImpl")?.configurable
+  )
+    throw new Error("Loomy 适配器契约已变化，请核对 src/core/upstream.ts")
 }
 
 /** 宿主调度只接这些实例成员；协议和凭据实现仍由上游负责。 */

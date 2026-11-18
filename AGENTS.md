@@ -22,7 +22,7 @@
 
 ## 架构
 
-本仓库是**薄胶水**：供应商协议、登录、续期、模型目录均复用上游；宿主补齐环境与 CodeArts 调度，不复制上游业务实现。
+本仓库是**薄胶水**：供应商协议、登录、续期、模型目录均复用上游；宿主补齐环境与 CodeArts / Loomy 调度，不复制上游业务实现。
 前端在 `web/`（Vite+ 构建，产物 `dist/` 被 `.gitignore` 排除）；后端在 `src/**/*.ts`（Express）。
 上游只通过 `package.json` 的 git 依赖引入，不复制其源码。
 
@@ -56,9 +56,11 @@
 批量解除走受保护的 `POST /admin/models/api/codearts/cooldowns/clear`，仍由上游账号池持久化。
 升级时同时核对 `consumeSse()`、`queryQueueStatus()`、可替换的 `fetchImpl` 与排队错误名称；输出后禁止内部重放。
 HTTP 错误响应中的已分类并发错误在传输边界交回调度，不依赖可能误报 `working` 的队列接口。
-唯一的模块路径例外是 `src/core/upstream.ts` 按插件入口相邻路径载入 `lib/llm-adapter.js` 的
+模块路径例外包括 `src/core/upstream.ts` 按插件入口相邻路径载入 `lib/llm-adapter.js` 的
 `isConcurrencyLimitError()` 纯函数；包根没有重导出它，故显式记录版本契约并在启动核对函数形状。
-此处复用原判据，不复制业务码解析，也不修改依赖文件。
+Loomy 接入同样由契约加载其 `loomy-adapter.js`、`loomy.js`、`loomy-credits.js`、
+`loomy-balance-rank.js` 和 `provider-runtime.js`；实际账号记账复用 `token-ledger.js`。
+这些入口均在 `src/core/upstream.ts` 检查函数形状；复用原判据，不复制协议，也不修改依赖文件。
 `LOG_LEVEL=debug` 的 `[codearts-scheduling]` 日志区分派发、获取名额、首个内容块与正文首字。
 
 `src/host/gateway-context.ts` 用 Node `http.server.request.start` 诊断事件为插件网关请求建立
@@ -78,6 +80,22 @@ AsyncLocalStorage 上下文，保留上游原请求处理器和鉴权；依赖�
 绑定号满载时优先等 1 秒，有其他空闲号则迁移；换号不重置等待预算。模型限流可尝试全池未用号，
 普通故障最多 3 次；首次请求取消且无其他活动请求时移除未确认绑定，旧请求不得覆盖新绑定。
 更改调度时同时核对调用方隔离、SSE/非流式、取消、账号禁用与模型限额迁移。
+
+### Loomy 调度与 TXT 导入
+
+`src/host/scheduled-adapter.ts` 在 CodeArts / Loomy 共用完整流租约、输出前换号、背压和取消；
+`src/host/loomy-scheduling.ts` 接入 Loomy 账号池与上游共享余额缓存，保留每日积分优先、永久锁与严格手动顺序。
+Loomy 默认每号 2 个在途，队列 100、等待 15 秒、绑定空闲 30 分钟、粘性等待 1 秒；使用独立 `LOOMY_*` 变量。
+Loomy 没有已验证的华为 60 秒会话窗口，流结束即回收名额；不复制 CodeArts 的保留规则。
+HTTP 429 随机模型冷却 60–180 秒；积分耗尽仍按上游次日零点恢复，不统一缩短旧的未知原因冷却。
+HTTP 200 内 `100002` 识别为认证失败；输出前可换号，已输出后不重放。上游协议和 SSE 解析仍原样复用。
+`POST /admin/models/api/loomy/cooldowns/clear` 与 CodeArts 共用受保护的范围校验和清理逻辑。
+`/healthz` 新增 `scheduling.loomy`，调度日志用 `[loomy-scheduling]`，不记录原始会话或密钥。
+
+前端 `AccountImport.tsx` 共用预览、确认和追加导入界面；CodeArts JSON 与 Loomy TXT 各自负责格式转换。
+TXT 每行 `手机号----32位十六进制 session token----userid`，多文件总计不超过 2 MB / 100 文件。
+通过上游 `backup.import` 的 merge 追加；官方凭据格式为 `{phone, access_token, userid}`，不伪造到期时间。
+测试夹具只用假凭据，真实账号测试结果见 `docs/loomy-scheduling-2026-11-19.md`。
 
 ### 管理界面装配
 
@@ -126,6 +144,8 @@ src/                       # 后端（Node / Express，TypeScript，按职责分
   core/                    home · logger · upstream(契约) · connection · errors · types · fs-store
   host/host.ts             上游宿主装配（五服务 + 装插件 + 契约核对）★核心
   host/codearts-scheduling.ts  CodeArts 适配器调度接入（复用上游协议与账号池）
+  host/loomy-scheduling.ts     Loomy 余额与调度接入
+  host/scheduled-adapter.ts   两渠道共用流生命周期、换号与取消
   host/gateway-context.ts  插件网关请求上下文（会话摘要）
   http/                    body · security · request · respond · error（HTTP 基础设施/适配）
   modules/                 领域模块（controller=HTTP 适配，service=业务）
@@ -572,7 +592,7 @@ data URL → 重写请求体再转发，**不改上游**。必须带的防护：
 import * as plugin from "dsh-providers-hub" // src/host/host.ts 唯一的一行
 ```
 
-宿主通过 cordis 注入、HTTP 转发与 CodeArts 调度钩子接入。上游常见改动（新增渠道、修协议、
+宿主通过 cordis 注入、HTTP 转发与 CodeArts / Loomy 调度钩子接入。上游常见改动（新增渠道、修协议、
 改额度逻辑、加模型、改 UI 布局）**都不需要动本仓库**：
 
 | 上游改了什么                      | 我们要改                          | 为什么                                                    |

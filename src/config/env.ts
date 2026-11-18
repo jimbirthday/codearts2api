@@ -44,23 +44,34 @@ export function resolveAdminAuth(env = process.env): boolean {
   return !["0", "false", "off", "no"].includes(raw)
 }
 
-export function resolveCodeArtsScheduling(env = process.env) {
-  const integer = (name: string, fallback: number, min: number, max: number) => {
-    const raw = env[name]?.trim()
-    if (!raw) return fallback
-    const value = Number(raw)
-    if (!Number.isInteger(value) || String(value) !== raw || value < min || value > max) {
-      throw new Error(`${name} 必须是 ${min} 到 ${max} 之间的整数`)
-    }
-    return value
-  }
+function schedulingInteger(env: NodeJS.ProcessEnv, name: string, fallback: number, min: number, max: number) {
+  const raw = env[name]?.trim()
+  if (!raw) return fallback
+  const value = Number(raw)
+  if (!Number.isInteger(value) || String(value) !== raw || value < min || value > max)
+    throw new Error(`${name} 必须是 ${min} 到 ${max} 之间的整数`)
+  return value
+}
+
+function commonScheduling(env: NodeJS.ProcessEnv, prefix: string, maxInFlight: number) {
   return {
-    maxInFlight: integer("CODEARTS_MAX_IN_FLIGHT", 3, 1, 100),
-    sessionLimit: integer("CODEARTS_SESSION_LIMIT", 3, 1, 100),
-    sessionTtlMs: integer("CODEARTS_SESSION_TTL_MS", 60_000, 0, 600_000),
-    queueLimit: integer("CODEARTS_QUEUE_LIMIT", 100, 0, 10_000),
-    queueTimeoutMs: integer("CODEARTS_QUEUE_TIMEOUT_MS", 15_000, 1, 120_000),
-    stickyTtlMs: integer("CODEARTS_STICKY_TTL_MS", 1_800_000, 1, 86_400_000),
-    stickyWaitMs: integer("CODEARTS_STICKY_WAIT_MS", 1000, 0, 120_000),
+    maxInFlight: schedulingInteger(env, `${prefix}_MAX_IN_FLIGHT`, maxInFlight, 1, 100),
+    queueLimit: schedulingInteger(env, `${prefix}_QUEUE_LIMIT`, 100, 0, 10_000),
+    queueTimeoutMs: schedulingInteger(env, `${prefix}_QUEUE_TIMEOUT_MS`, 15_000, 1, 120_000),
+    stickyTtlMs: schedulingInteger(env, `${prefix}_STICKY_TTL_MS`, 1_800_000, 1, 86_400_000),
+    stickyWaitMs: schedulingInteger(env, `${prefix}_STICKY_WAIT_MS`, 1000, 0, 120_000),
   }
+}
+
+export function resolveCodeArtsScheduling(env = process.env) {
+  return {
+    ...commonScheduling(env, "CODEARTS", 3),
+    sessionLimit: schedulingInteger(env, "CODEARTS_SESSION_LIMIT", 3, 1, 100),
+    sessionTtlMs: schedulingInteger(env, "CODEARTS_SESSION_TTL_MS", 60_000, 0, 600_000),
+  }
+}
+
+export function resolveLoomyScheduling(env = process.env) {
+  const config = commonScheduling(env, "LOOMY", 2)
+  return { ...config, sessionLimit: config.maxInFlight, sessionTtlMs: 0 }
 }

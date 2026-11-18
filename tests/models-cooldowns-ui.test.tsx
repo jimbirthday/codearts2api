@@ -68,6 +68,17 @@ test("其他渠道不显示 CodeArts 冷却操作", async () => {
   assert.equal(screen.queryByRole("button", { name: "解除全部冷却" }), null)
 })
 
+test("Loomy 复用批量解除入口，提交到自身渠道", async () => {
+  const env = setup("loomy")
+  fireEvent.click(await screen.findByLabelText("模型A 冷却选择"))
+  fireEvent.click(screen.getByRole("button", { name: "解除所选冷却（1）" }))
+  await waitFor(() => assert.ok(env.fetcher.mock.calls.some((call) => call[1].method === "POST")))
+  const post = env.fetcher.mock.calls.find((call) => call[1].method === "POST")!
+  assert.equal(post[0], "/admin/models/api/loomy/cooldowns/clear")
+  env.finish({ ok: true, json: async () => ({ cleared: 2, affectedAccounts: 2, failed: [] }) })
+  await screen.findByText("已解除 2 条模型冷却，涉及 2 个账号")
+})
+
 test("部分账号失败在刷新后仍提示，并保留模型选择供重试", async () => {
   const env = setup()
   fireEvent.click(await screen.findByLabelText("模型A 冷却选择"))

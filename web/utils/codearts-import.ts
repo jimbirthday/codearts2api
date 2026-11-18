@@ -1,29 +1,7 @@
-export interface ImportRow {
-  source: string
-  status: "ready" | "skipped" | "invalid"
-  message: string
-}
+import type { AccountImportBatch } from "./account-import"
 
-export interface CodeArtsImportBatch {
-  payload: {
-    format: "dsh-codearts-auth/backup"
-    version: 1
-    exportedAt: string
-    credentials: Record<string, string>
-    accounts: Array<{
-      id: string
-      provider: "codearts"
-      nickname: string
-      enabled: boolean
-      credentialRef: string
-      refreshable: boolean
-      createdAt: number
-      expiresAt: number
-    }>
-    disabledModels: Record<string, never>
-  }
-  rows: ImportRow[]
-}
+export type { ImportRow } from "./account-import"
+export type CodeArtsImportBatch = AccountImportBatch
 
 function object(value: unknown): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("账号必须是 JSON 对象")

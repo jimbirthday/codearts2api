@@ -2,12 +2,21 @@ import { useRef, useState } from "react"
 
 import { hostRpcCall } from "../../api/rpc"
 import { exportCodeArtsAccounts } from "../../utils/codearts-export"
-import { prepareCodeArtsImport, type CodeArtsImportBatch } from "../../utils/codearts-import"
+import { prepareCodeArtsImport } from "../../utils/codearts-import"
+import { prepareLoomyImport } from "../../utils/loomy-import"
+import type { AccountImportBatch } from "../../utils/account-import"
 import styles from "./CodeArtsImport.module.less"
 
-export function CodeArtsImport({ onImported }: { onImported: () => void }) {
+export function AccountImport({
+  provider = "codearts",
+  onImported,
+}: {
+  provider?: "codearts" | "loomy"
+  onImported: () => void
+}) {
+  const label = provider === "codearts" ? "CodeArts JSON" : "Loomy TXT"
   const inputRef = useRef<HTMLInputElement>(null)
-  const [batch, setBatch] = useState<CodeArtsImportBatch | null>(null)
+  const [batch, setBatch] = useState<AccountImportBatch | null>(null)
   const [busy, setBusy] = useState(false)
   const [exporting, setExporting] = useState(false)
   const [notice, setNotice] = useState("")
@@ -20,7 +29,7 @@ export function CodeArtsImport({ onImported }: { onImported: () => void }) {
     setError("")
     setBusy(true)
     try {
-      const prepared = await prepareCodeArtsImport(files)
+      const prepared = await (provider === "codearts" ? prepareCodeArtsImport : prepareLoomyImport)(files)
       setBatch(prepared)
     } catch (caught) {
       setError((caught as Error).message)
@@ -92,21 +101,27 @@ export function CodeArtsImport({ onImported }: { onImported: () => void }) {
   const count = batch?.payload.accounts.length ?? 0
   const rows = batch?.rows ?? []
   return (
-    <section className={styles.importer} aria-label="CodeArts JSON 导入与导出" aria-busy={busy}>
+    <section
+      className={styles.importer}
+      aria-label={`${label} 导入${provider === "codearts" ? "与导出" : ""}`}
+      aria-busy={busy}
+    >
       <div className={styles.toolbar}>
         <button type="button" className="c2a-btn" disabled={busy} onClick={() => inputRef.current?.click()}>
-          {busy && !exporting ? "处理中…" : "导入 CodeArts JSON"}
+          {busy && !exporting ? "处理中…" : `导入 ${label}`}
         </button>
-        <button type="button" className="c2a-btn" disabled={busy} onClick={download}>
-          {exporting ? "导出中…" : "导出 CodeArts JSON"}
-        </button>
+        {provider === "codearts" ? (
+          <button type="button" className="c2a-btn" disabled={busy} onClick={download}>
+            {exporting ? "导出中…" : "导出 CodeArts JSON"}
+          </button>
+        ) : null}
         <input
           ref={inputRef}
           type="file"
-          accept=".json,application/json"
+          accept={provider === "codearts" ? ".json,application/json" : ".txt,text/plain"}
           multiple
           hidden
-          aria-label="CodeArts JSON 文件"
+          aria-label={`${label} 文件`}
           onChange={(event) => {
             const files = Array.from(event.target.files ?? [])
             event.target.value = ""
@@ -114,7 +129,9 @@ export function CodeArtsImport({ onImported }: { onImported: () => void }) {
           }}
         />
         <span className={styles.hint}>
-          导入支持单个或多个文件，每批最多 100 个文件 / 2 MB；导出包含当前账号密钥与续期材料。
+          {provider === "codearts"
+            ? "导入支持单个或多个文件，每批最多 100 个文件 / 2 MB；导出包含当前账号密钥与续期材料。"
+            : "每行：手机号----session token----userid；支持多个 TXT 文件，每批最多 100 个 / 2 MB。"}
         </span>
       </div>
       {batch ? (

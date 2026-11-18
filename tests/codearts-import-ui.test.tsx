@@ -3,7 +3,7 @@ import assert from "node:assert/strict"
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, test, vi } from "vite-plus/test"
 
-import { CodeArtsImport } from "../web/pages/channels/CodeArtsImport"
+import { AccountImport as CodeArtsImport } from "../web/pages/channels/AccountImport"
 import { prepareCodeArtsImport } from "../web/utils/codearts-import"
 import { codeArtsJson, jsonFile } from "./fixtures/codearts-import"
 
