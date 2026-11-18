@@ -103,8 +103,10 @@ test("真实 Chat/Responses/直连网关：会话固定账号与 Chat-Id，每�
   assert.equal(env.app.host.codeartsScheduling.stats().inFlight, 0)
 })
 
-test("真实 HTTP 并发：20 个请求在两账号上运行，每号最大在途不超过 2", async (t) => {
-  const env = await setup(t, 2, { CODEARTS_MAX_IN_FLIGHT: "2" })
+test("默认 HTTP 并发：20 个请求在两账号上运行，每号最大在途为 3", async (t) => {
+  vi.stubEnv("CODEARTS_MAX_IN_FLIGHT", undefined)
+  const env = await setup(t)
+  assert.equal(env.app.host.codeartsScheduling.stats().maxInFlight, 3)
   const active = new Map<string, number>()
   const peak = new Map<string, number>()
   env.setAnswer(async (_url, init) => {
@@ -131,13 +133,17 @@ test("真实 HTTP 并发：20 个请求在两账号上运行，每号最大在�
     }),
   )
   assert.equal(peak.size, 2)
-  assert.ok([...peak.values()].every((value) => value === 2))
+  assert.ok([...peak.values()].every((value) => value === 3))
   assert.equal(env.app.host.codeartsScheduling.stats().inFlight, 0)
   assert.equal(env.app.host.codeartsScheduling.stats().queued, 0)
 })
 
 test("流式输出期间继续占用名额；排队取消与生成取消都回收名额", async (t) => {
-  const env = await setup(t, 1, { CODEARTS_QUEUE_LIMIT: "1", CODEARTS_QUEUE_TIMEOUT_MS: "1000" })
+  const env = await setup(t, 1, {
+    CODEARTS_MAX_IN_FLIGHT: "1",
+    CODEARTS_QUEUE_LIMIT: "1",
+    CODEARTS_QUEUE_TIMEOUT_MS: "1000",
+  })
   let upstreamAborted = false
   env.setAnswer(
     async (_url, init) =>
@@ -432,7 +438,7 @@ test("诊断区分首个推理块与最终正文补出，不记录提示词或�
 })
 
 test("真实 SSE 粘性：绑定号忙时等待，其他会话仍能使用空闲账号", async (t) => {
-  const env = await setup(t)
+  const env = await setup(t, 2, { CODEARTS_MAX_IN_FLIGHT: "1" })
   let finish: () => void = () => {}
   env.setAnswer(async () =>
     env.calls.length === 1

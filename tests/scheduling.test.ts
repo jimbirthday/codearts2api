@@ -219,8 +219,11 @@ test("会话键：显式 ID 优先、按调用方隔离、兼容 Responses，历
   )
 })
 
-test("调度配置非法值直接失败，默认保守限制每号 1 个在途", () => {
-  assert.equal(resolveCodeArtsScheduling({}).maxInFlight, 1)
+test("调度配置非法值直接失败，默认每号 3 个在途，显式配置优先", () => {
+  assert.equal(resolveCodeArtsScheduling({}).maxInFlight, 3)
+  assert.equal(resolveCodeArtsScheduling({ CODEARTS_MAX_IN_FLIGHT: "" }).maxInFlight, 3)
+  assert.equal(resolveCodeArtsScheduling({ CODEARTS_MAX_IN_FLIGHT: "1" }).maxInFlight, 1)
+  assert.equal(resolveCodeArtsScheduling({ CODEARTS_MAX_IN_FLIGHT: "2" }).maxInFlight, 2)
   assert.equal(resolveCodeArtsScheduling({ CODEARTS_QUEUE_LIMIT: "0" }).queueLimit, 0)
   for (const raw of ["0", "-1", "1.5", "Infinity", "001", "101"]) {
     assert.throws(() => resolveCodeArtsScheduling({ CODEARTS_MAX_IN_FLIGHT: raw }), /CODEARTS_MAX_IN_FLIGHT/)

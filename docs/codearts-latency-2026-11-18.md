@@ -52,7 +52,7 @@
 
 ## 使用与范围
 
-可先设置 `CODEARTS_MAX_IN_FLIGHT=2` 试用每号两个在途；默认值仍为 1。
+本次实测时默认值为 1；后续按用户要求，`CODEARTS_MAX_IN_FLIGHT` 默认已调整为 3，显式配置仍可覆盖。
 `LOG_LEVEL=debug` 的 `[codearts-scheduling]` 日志包含获取名额、首个内容块、正文首字、总耗时与尝试数，
 可用于区分本地排队、上游等待和先输出推理的情况。
 
