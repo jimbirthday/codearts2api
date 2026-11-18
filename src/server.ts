@@ -146,6 +146,7 @@ export async function createHttpServer(host, options: any = {}) {
         proxyGateway,
         adminAuth: adminKeyEnabled(),
         gateway,
+        scheduling: { codearts: host.codeartsScheduling?.stats() },
       })
     }),
   )

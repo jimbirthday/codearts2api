@@ -43,3 +43,21 @@ export function resolveAdminAuth(env = process.env): boolean {
   if (raw === undefined || raw === "") return true
   return !["0", "false", "off", "no"].includes(raw)
 }
+
+export function resolveCodeArtsScheduling(env = process.env) {
+  const integer = (name: string, fallback: number, min: number, max: number) => {
+    const raw = env[name]?.trim()
+    if (!raw) return fallback
+    const value = Number(raw)
+    if (!Number.isInteger(value) || String(value) !== raw || value < min || value > max) {
+      throw new Error(`${name} 必须是 ${min} 到 ${max} 之间的整数`)
+    }
+    return value
+  }
+  return {
+    maxInFlight: integer("CODEARTS_MAX_IN_FLIGHT", 1, 1, 100),
+    queueLimit: integer("CODEARTS_QUEUE_LIMIT", 100, 0, 10_000),
+    queueTimeoutMs: integer("CODEARTS_QUEUE_TIMEOUT_MS", 15_000, 1, 120_000),
+    stickyTtlMs: integer("CODEARTS_STICKY_TTL_MS", 1_800_000, 1, 86_400_000),
+  }
+}

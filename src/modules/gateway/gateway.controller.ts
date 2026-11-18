@@ -21,6 +21,12 @@ export function createGatewayController({ host, callerGate, logger, upstreamTime
 
   async function proxyToGateway(request: any, response: any, url: any) {
     const startedAt = Date.now()
+    const disconnected = new AbortController()
+    const onClose = () => {
+      if (!response.writableEnded) disconnected.abort()
+    }
+    response.once("close", onClose)
+    response.once("finish", () => response.off("close", onClose))
     const target = await resolveGatewayTarget()
     const headers = new Headers()
     for (const [key, value] of Object.entries(request.headers)) {
@@ -58,9 +64,10 @@ export function createGatewayController({ host, callerGate, logger, upstreamTime
         headers,
         body: gateBody ?? (hasBody ? request : undefined),
         ...(hasBody ? { duplex: "half" } : {}),
-        signal: AbortSignal.timeout(upstreamTimeoutMs ?? 600_000),
+        signal: AbortSignal.any([disconnected.signal, AbortSignal.timeout(upstreamTimeoutMs ?? 600_000)]),
       } as any)
     } catch (error) {
+      if (disconnected.signal.aborted) return
       logger?.warn?.(`[proxy] 网关不可达（${target.host}:${target.port}）：${String(error)}`)
       sendAdminJson(response, 502, {
         error: {

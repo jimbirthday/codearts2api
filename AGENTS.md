@@ -22,7 +22,7 @@
 
 ## 架构
 
-本仓库是**薄胶水**：全部实现都是「把上游需要的宿主环境就位」，业务逻辑一行都不复制。
+本仓库是**薄胶水**：供应商协议、登录、续期、模型目录均复用上游；宿主补齐环境与 CodeArts 调度，不复制上游业务实现。
 前端在 `web/`（Vite+ 构建，产物 `dist/` 被 `.gitignore` 排除）；后端在 `src/**/*.ts`（Express）。
 上游只通过 `package.json` 的 git 依赖引入，不复制其源码。
 
@@ -42,6 +42,23 @@
 > ⚠️ 凭据服务**必须走 `ctx.plugin()`**，不能 `new LocalCredentialProvider(...)`：载入既有
 > 凭据的逻辑在它的 `[Service.init]` 生成器里，只有被 cordis 当作插件装载时才会执行 ——
 > 手动 `new` 的实例**不会读磁盘上的既有凭据**且不报错（症状同样是「凭据未配置」）。
+
+### CodeArts 调度接入
+
+`src/host/codearts-scheduling.ts` 在插件装载前包装 `llm.registerAdapter`，仅对 CodeArts 的
+`prepareCall().stream()` / `stream()` 接入宿主调度；选号过滤与凭据读取仍调用上游账号池，
+登录、签名、模型目录、推理协议与续期仍由上游实现。相关实例成员在
+`src/core/upstream.ts` 的 `assertCodeArtsSchedulingContract()` 启动核对，升级时必须跑调度集成测试。
+
+`src/host/gateway-context.ts` 用 Node `http.server.request.start` 诊断事件为插件网关请求建立
+AsyncLocalStorage 上下文，保留上游原请求处理器和鉴权；依赖单个 `request` 监听器，契约漂移返回
+可读 503。会话正文额外解析以 `BODY_LIMIT` 为上限，超出后使用显式会话请求头。
+调度覆盖反代、直连网关和聚合到 CodeArts 的入口；内部换号也须释放旧租约、获取新租约，
+完整流结束或取消才释放当前租约。Chat-Id 按会话和账号稳定，Session-Id 按推理任务隔离。
+
+`src/modules/scheduling/` 保存单进程的会话摘要、账号在途计数和有界等待队列，不持久化；
+多实例不共享名额。默认每号 1 个在途、队列 100、等待 15 秒、绑定空闲 30 分钟。
+更改调度时同时核对调用方隔离、SSE/非流式、取消、账号禁用与模型限额迁移。
 
 ### 管理界面装配
 
@@ -89,6 +106,8 @@ src/                       # 后端（Node / Express，TypeScript，按职责分
   config/env.ts            环境变量解析（PORT/HOST/PROXY_GATEWAY/ADMIN_AUTH）
   core/                    home · logger · upstream(契约) · connection · errors · types · fs-store
   host/host.ts             上游宿主装配（五服务 + 装插件 + 契约核对）★核心
+  host/codearts-scheduling.ts  CodeArts 适配器调度接入（复用上游协议与账号池）
+  host/gateway-context.ts  插件网关请求上下文（会话摘要）
   http/                    body · security · request · respond · error（HTTP 基础设施/适配）
   modules/                 领域模块（controller=HTTP 适配，service=业务）
     auth/                  auth.service · login.controller
@@ -98,6 +117,7 @@ src/                       # 后端（Node / Express，TypeScript，按职责分
     models/                models.service · models.controller
     oauth-relay/           oauth-relay.service · oauth-relay.controller
     gateway/               gateway.service · gateway.controller · gateway-key.service
+    scheduling/            account-scheduler（粘性/在途/排队） · session-key（会话摘要）
     frontend/              frontend.controller
 
 tests/                     # 行为/UI 测试（Vitest，*.test.{ts,tsx}；组件用 jsdom）
@@ -144,6 +164,10 @@ pnpm run format:check                          # = vp fmt --check .
 | `DSH_OPENAI_GATEWAY_PORT`    | `8326`            | 插件网关端口（只绑 `127.0.0.1`，见下）                                            |
 | `DSH_OPENAI_GATEWAY_ENABLED` | `1`               | 置 `0/false/off/no` 则**强制停用**网关（面板开关会显示被 env 阻止，且无法再打开） |
 | `DSH_OPENAI_GATEWAY_API_KEY` | 自动生成          | 网关 Bearer Key，优先于文件                                                       |
+| `CODEARTS_MAX_IN_FLIGHT` | `1` | 每账号推理在途上限，1–100，跨模型与调用方共享 |
+| `CODEARTS_QUEUE_LIMIT` | `100` | 等待名额的队列上限，0–10000，0 表示不排队 |
+| `CODEARTS_QUEUE_TIMEOUT_MS` | `15000` | 单次等待名额超时，1–120000 毫秒 |
+| `CODEARTS_STICKY_TTL_MS` | `1800000` | 会话绑定空闲期限，1–86400000 毫秒 |
 | `LOG_LEVEL`                  | `info`            | `silent` / `error` / `info` / `debug`                                             |
 
 ### 状态目录
@@ -454,6 +478,9 @@ addedNode / characterData / 端口越界 / 幂等）、「回调修复」交互�
 越界端口禁用、Esc 关闭、busy 时 Esc 不关）、日期下拉外部点击关闭、「查询」不吞点击、FormModal（Esc / 遮罩 / 首焦）、
 SecretModal（Esc 不关且 onClose 不被调用）、主题与自动刷新**存储 key 迁移**（c2→c2a）；以及 callers/overview 格式化纯逻辑测试；
 `caller-gate.test.ts` 覆盖用量日志耗时从请求进入时算起。
+**CodeArts 调度**：百请求并发在途上限、粘性等待与队列超时/取消、模型限额迁移、旧请求不覆盖新绑定、
+TTL、坏凭据回收，以及真实 HTTP Chat/Responses/聚合入口、SSE 完整生命周期、内部额度换号、
+实际账号续期、输出前失败重试与输出后禁止重放、调用方隔离（仅模拟外部供应商传输）。
 
 ### 设计决策：外部图片 URL 为什么被拒
 
@@ -510,13 +537,13 @@ data URL → 重写请求体再转发，**不改上游**。必须带的防护：
 
 ### 升级时需要改多少代码
 
-我们与上游的**代码**耦合只有一处：
+上游插件的包入口仍只有一处：
 
 ```js
 import * as plugin from "dsh-providers-hub" // src/host/host.ts 唯一的一行
 ```
 
-其余全靠 cordis 的注入机制与 HTTP 转发。因此上游常见的改动类型（新增渠道、修协议、
+宿主通过 cordis 注入、HTTP 转发与 CodeArts 调度钩子接入。上游常见改动（新增渠道、修协议、
 改额度逻辑、加模型、改 UI 布局）**都不需要动本仓库**：
 
 | 上游改了什么                      | 我们要改                          | 为什么                                                    |
@@ -530,6 +557,7 @@ import * as plugin from "dsh-providers-hub" // src/host/host.ts 唯一的一行
 | **改 RPC 信封 / 线协议**          | 1 个函数                          | `src/core/upstream.ts` 的 `rpcEnvelope()`                      |
 | **改客户端 loader 形态**          | 可能 1~2 处                       | `web/index.html` + `web/api/upstream.tsx`                     |
 | **改 slot 名 `settings.section`** | 1 个常量                          | `src/core/upstream.ts`                                         |
+| **改 CodeArts 账号池/适配器成员** | 契约断言与宿主调度钩子 | 核对 `src/core/upstream.ts`、`src/host/codearts-scheduling.ts` 并跑调度测试 |
 | **改插件 `inject` 列表**          | `src/host/host.ts` 的 provide          | 少了服务插件会永久 pending                                |
 
 ### 自动升级（GitHub Actions）

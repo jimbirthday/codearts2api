@@ -66,6 +66,7 @@ import { createConnection } from "../core/connection.ts"
 import { pinHome } from "../core/home.ts"
 import { installLogger } from "../core/logger.ts"
 import { CARRIER_PATH, JET_HUB_PATH, rpcEnvelope } from "../core/upstream.ts"
+import { installCodeArtsScheduling } from "./codearts-scheduling.ts"
 
 /** 凭据文档名（与官方实现一致）。 */
 const CREDENTIALS_FILENAME = ".credentials.yaml"
@@ -216,10 +217,12 @@ export async function createHost() {
 
   // ④ llm：真实的 LLM 运行时。必须在 ctx.plugin 之前构造（它自己 provide）。
   new LlmRuntime(ctx)
+  const codeartsScheduling = installCodeArtsScheduling(ctx)
 
   // ⑤ 装载插件。返回的是 thenable 的 Fiber，await 即「apply 已完成」。
   //    此处不 try/catch：插件装不上就是致命错误，不该带着残缺状态继续服务。
   const fiber = await ctx.plugin(plugin)
+  codeartsScheduling.assertReady()
 
   // ⑥ 核对上游契约 —— **启动即失败，而不是等用户点到某个按钮才 404**。
   //
@@ -246,6 +249,7 @@ export async function createHost() {
   return {
     ctx,
     home,
+    codeartsScheduling,
     /** 凭据文档路径（供 /healthz 自查）。 */
     credentialsFile: join(home, CREDENTIALS_FILENAME),
     /** 插件已注册的 HTTP 路由（`path → route`）。 */

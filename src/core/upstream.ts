@@ -7,8 +7,7 @@
  * 散落在各文件里（各处零散常量），升级上游
  * 时要靠 grep 找全，漏一处就是「一半能用一半 404」。
  *
- * 集中之后，上游改名/改协议时**改这一个文件**即可，且 `UPSTREAM_CONTRACT`
- * 会把这些假设显式列出来，方便升级时逐条核对。
+ * 上游改名/改协议时先从这里核对；`UPSTREAM_CONTRACT` 与断言显式列出这些假设。
  *
  * ## 目前依赖上游的哪些约定
  *
@@ -21,6 +20,8 @@
  * | slot 名 `settings.section` | `plugin-src/client/index.js` | `/admin` 抛出「未注册」 |
  * | 插件 `inject = ['credentials','commands','llm']` | `src/index.ts` | 缺服务则永久 pending |
  * | 网关绑 `127.0.0.1` | `openai-gateway/config.ts` | 容器必须走反代 |
+ * | CodeArts 账号池、适配器 options / prepareCall / 会话字段 | `assertCodeArtsSchedulingContract` | 启动失败，核对宿主调度钩子 |
+ * | 网关单个 request 监听器 | `host/gateway-context.ts` | 返回可读 503，核对请求入口 |
  */
 
 /** Jet Hub 管理端点路径（上游 `JET_HUB_API_PATH`）。 */
@@ -34,6 +35,25 @@ export const JET_HUB_ENDPOINT = "jet-hub"
 
 /** 客户端 bundle 会注册的 slot 名（我们据此把页面组件捞出来）。 */
 export const SETTINGS_SECTION_SLOT = "settings.section"
+
+/** 宿主调度只接这些实例成员；不导入或复制上游内部模块。 */
+export function assertCodeArtsSchedulingContract(adapter: any) {
+  const pool = adapter?.options?.accountPool
+  if (
+    !pool ||
+    !["candidateAccounts", "resolveFirstCredential", "getAvailableAccount"].every(
+      (name) => typeof pool[name] === "function",
+    ) ||
+    typeof adapter.options.resolveCredential !== "function" ||
+    typeof adapter.options.refresh !== "function" ||
+    typeof adapter.prepareCall !== "function" ||
+    !["chatId", "sessionId"].every(
+      (name) => typeof adapter[name] === "string" && Object.getOwnPropertyDescriptor(adapter, name)?.configurable,
+    )
+  ) {
+    throw new Error("CodeArts 调度契约已变化，请核对上游账号池、适配器 options 与会话字段（src/core/upstream.ts）")
+  }
+}
 
 /** 服务端 RPC 的规范错误信封里用到的字段（仅文档用途）。 */
 export const UPSTREAM_CONTRACT = Object.freeze({
