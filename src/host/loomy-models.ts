@@ -2,14 +2,16 @@ import { createHash } from "node:crypto"
 
 /** 每个账号的模型权限独立缓存；未知模型不能交给 Loomy 静默回退成 Spark。 */
 export function createLoomyModels({ native, pool, adapter, fetcher }: any) {
-  const snapshots = new Map<string, { key: string; cache: any }>()
+  const snapshots = new Map<string, { key: string; cache: any; signal: AbortSignal }>()
+  let loading: Promise<any[]> | undefined
   const models = new Map<string, any[] | undefined>()
-  const read = async ({ entry, credential }: any) => {
+  const read = async ({ entry, credential }: any, signal: AbortSignal) => {
     const key = createHash("sha256").update(String(credential.access_token)).digest("hex")
     let snapshot = snapshots.get(entry.id)
     if (snapshot?.key !== key) {
       snapshot = {
         key,
+        signal,
         cache: new native.TtlCache({
           ttlMs: native.catalogTtlMs,
           ttlFor: (reading: any) => (reading.models ? native.catalogTtlMs : 15_000),
@@ -17,7 +19,7 @@ export function createLoomyModels({ native, pool, adapter, fetcher }: any) {
             try {
               const response = await fetcher(`${adapter.product.apiBase}/models`, {
                 headers: native.businessHeaders(credential.access_token),
-                signal: AbortSignal.timeout(10_000),
+                signal: snapshot!.signal,
               })
               if (!response.ok) {
                 await response.body?.cancel()
@@ -36,37 +38,62 @@ export function createLoomyModels({ native, pool, adapter, fetcher }: any) {
       }
       snapshots.set(entry.id, snapshot)
     }
+    snapshot.signal = signal
     const reading = await snapshot.cache.get()
     if (snapshots.get(entry.id) === snapshot) models.set(entry.id, reading.models)
     return reading.models as any[] | undefined
   }
-  return {
-    async load() {
-      const entries = pool.candidateAccounts("loomy", "", new Set())
-      const ids = new Set(entries.map((entry: any) => entry.id))
-      for (const id of models.keys())
-        if (!ids.has(id)) {
-          snapshots.delete(id)
-          models.delete(id)
-        }
-      const union = new Map<string, any>()
-      // 冷池限制目录查询并发；热池的 TTL 命中不再发网络请求。
-      let cursor = 0
-      await Promise.all(
-        Array.from({ length: Math.min(3, entries.length) }, async () => {
-          for (;;) {
-            const entry = entries[cursor++]
-            if (!entry) return
-            const account = await pool.resolveFirstCredential("loomy", [entry])
-            if (!account) {
-              models.delete(entry.id)
-              continue
-            }
-            for (const model of (await read(account)) ?? []) if (!union.has(model.id)) union.set(model.id, model)
+  const load = async () => {
+    const entries = pool.candidateAccounts("loomy", "", new Set())
+    const ids = new Set(entries.map((entry: any) => entry.id))
+    for (const id of models.keys())
+      if (!ids.has(id)) {
+        snapshots.delete(id)
+        models.delete(id)
+      }
+    const union = new Map<string, any>()
+    // 冷池限制目录查询并发；热池的 TTL 命中不再发网络请求。
+    let cursor = 0
+    const timeout = new AbortController()
+    let timer: ReturnType<typeof setTimeout>
+    const work = Promise.all(
+      Array.from({ length: Math.min(3, entries.length) }, async () => {
+        for (;;) {
+          if (timeout.signal.aborted) return
+          const entry = entries[cursor++]
+          if (!entry) return
+          const account = await pool.resolveFirstCredential("loomy", [entry])
+          if (!account) {
+            models.delete(entry.id)
+            continue
           }
+          for (const model of (await read(account, timeout.signal)) ?? [])
+            if (!union.has(model.id)) union.set(model.id, model)
+        }
+      }),
+    )
+    try {
+      // 总预算覆盖整个池，不能把每批账号的超时串起来累加。
+      await Promise.race([
+        work,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(() => {
+            timeout.abort()
+            resolve()
+          }, 10_000)
         }),
-      )
-      return [...union.values()]
+      ])
+    } finally {
+      clearTimeout(timer!)
+    }
+    return [...union.values()]
+  }
+  return {
+    load() {
+      loading ??= load().finally(() => {
+        loading = undefined
+      })
+      return loading
     },
     modelFor(id: string, requested: string) {
       const available = models.get(id) ?? []

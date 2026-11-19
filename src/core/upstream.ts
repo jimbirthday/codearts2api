@@ -62,9 +62,8 @@ export async function loadSchedulingLedger(): Promise<(provider: string, account
 /** Loomy 的协议、余额与失败分类继续复用锁定版本的上游模块。 */
 export async function loadLoomyScheduling() {
   const base = import.meta.resolve("dsh-providers-hub")
-  const [adapter, credits, ranks, runtime, protocol, catalog, cache, product] = await Promise.all([
+  const [adapter, ranks, runtime, protocol, catalog, cache, product] = await Promise.all([
     import(new URL("./loomy-adapter.js", base).href),
-    import(new URL("./loomy-credits.js", base).href),
     import(new URL("./loomy-balance-rank.js", base).href),
     import(new URL("./provider-runtime.js", base).href),
     import(new URL("./loomy.js", base).href),
@@ -75,7 +74,6 @@ export async function loadLoomyScheduling() {
   const result = {
     classify: adapter.classifyLoomyFailure,
     quotaResetAt: adapter.loomyCooldownResetAtMs,
-    fetchBalance: credits.fetchLoomyCreditDetail,
     tier: ranks.loomyBalanceTier,
     tierUsable: ranks.loomyTierUsable,
     balanceCache: runtime.balanceCacheOf,

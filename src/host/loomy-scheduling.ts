@@ -46,7 +46,9 @@ export async function installLoomyScheduling(
       catalog.clear()
       return catalog.load()
     }
-    const balances = new Map<string, any>()
+    const balanceCache = native.balanceCache()
+    if (typeof balanceCache?.peek !== "function")
+      throw new Error("Loomy 余额缓存契约已变化，请核对 src/core/upstream.ts")
     const manualOrder = new Map<string, number>()
     const cooling = (entry: any, model: string) =>
       Object.entries(entry.modelRateLimits ?? {}).some(
@@ -73,24 +75,27 @@ export async function installLoomyScheduling(
           { status: unknown ? 503 : 404 },
         )
       }
-      const options = { allowPermanent: !pool.permanentLocked("loomy") }
-      const ranked = available.map((entry: any) => ({
-        entry,
-        tier: native.tier(balances.get(entry.id) ?? {}, options),
-      }))
-      if (!options.allowPermanent && ranked.length && ranked.every((item: any) => !native.tierUsable(item.tier))) {
-        const unknown = available.some((entry: any) => !balances.get(entry.id)?.ok)
-        throw new LlmError(
-          unknown ? "Loomy 余额暂时无法确认，永久积分保持锁定，请稍后重试" : "Loomy 今日额度已用尽，永久积分保持锁定",
-          unknown ? "TRANSPORT" : "QUOTA_EXCEEDED",
+      const allowPermanent = !pool.permanentLocked("loomy")
+      let unknown = false
+      const usable = available.filter((entry: any) => {
+        // 只读后台共享缓存；请求路径禁止冷余额回源或按余额档位排序。
+        const packages = balanceCache.peek("loomy", entry.id)?.value?.packages ?? []
+        const dailyBalance = packages.find((pkg: any) => pkg.name.includes("每日"))?.remaining
+        const permanentBalance = packages.find((pkg: any) => pkg.name.includes("永久"))?.remaining
+        const known = dailyBalance !== undefined || permanentBalance !== undefined
+        unknown ||= !known
+        return (
+          (!known && allowPermanent) ||
+          native.tierUsable(native.tier({ dailyBalance, permanentBalance }, { allowPermanent }))
         )
-      }
-      const best = Math.min(...ranked.map((item: any) => item.tier))
-      if (pool.strictManualOrder?.("loomy")) {
-        const usable = ranked.filter((item: any) => native.tierUsable(item.tier))
-        return (usable.length ? usable : ranked).map((item: any) => item.entry)
-      }
-      return ranked.filter((item: any) => item.tier === best).map((item: any) => item.entry)
+      })
+      if (available.length && !usable.length)
+        throw new LlmError(
+          unknown ? "Loomy 后台尚未取得账号余额，请稍后重试" : "Loomy 当前账号的可用积分已用尽",
+          unknown ? "TRANSPORT" : "QUOTA_EXCEEDED",
+          { status: unknown ? 503 : 429 },
+        )
+      return usable
     }
     scheduler = createAccountScheduler({
       config,
@@ -103,38 +108,11 @@ export async function installLoomyScheduling(
     adapter.options.resolveCredential = async (...args: any[]) => {
       const state = dispatch.getStore()
       if (!state) return resolve(...args)
-      if (!state.balancesReady) {
+      if (!state.catalogReady) {
         await waitForAbort(catalog.load(), state.signal)
-        const entries = baseCandidates(state.model, state.excluded).filter((entry: any) =>
-          catalog.modelFor(entry.id, state.model),
-        )
-        const readings = await waitForAbort(
-          Promise.all(
-            entries.map(async (entry: any) => {
-              const account = await pool.resolveFirstCredential("loomy", [entry])
-              if (!account) return [entry.id, { ok: false }]
-              const cache = native.balanceCache()
-              if (cache) {
-                const reading = await cache.readStale("loomy", entry.id, { credential: account.credential })
-                const packages = reading.value?.packages ?? []
-                // CreditBalance 的两池名称是上游注册表契约，余额值与缓存新鲜度由上游维护。
-                const dailyBalance = packages.find((pkg: any) => pkg.name.includes("每日"))?.remaining
-                const permanentBalance = packages.find((pkg: any) => pkg.name.includes("永久"))?.remaining
-                return [
-                  entry.id,
-                  { ok: dailyBalance !== undefined || permanentBalance !== undefined, dailyBalance, permanentBalance },
-                ]
-              }
-              const balance = await native.fetchBalance(account.credential, adapter.product, adapter.fetchImpl)
-              return [entry.id, { ok: !!balance, dailyBalance: balance?.daily, permanentBalance: balance?.permanent }]
-            }),
-          ),
-          state.signal,
-        )
-        for (const [id, balance] of readings) balances.set(id, balance)
         manualOrder.clear()
         baseCandidates("", new Set()).forEach((entry: any, index: number) => manualOrder.set(entry.id, index))
-        state.balancesReady = true
+        state.catalogReady = true
       }
       state.signal?.throwIfAborted()
       const account = await acquireScheduledAccount(state, scheduler)
@@ -177,7 +155,25 @@ export async function installLoomyScheduling(
         body.prompt_cache_key = createHash("sha256")
           .update(`loomy\0${state.sessionKey ?? state.requestId}\0${state.lease?.entry.id ?? ""}`)
           .digest("hex")
-        const response = await fetcher.call(this, url, { ...init, body: JSON.stringify(body) })
+        // 上游首 token 计时从响应头之后开始；这里补齐等待响应头的同一预算。
+        const rawTimeout = Number(process.env.DSH_LOOMY_FIRST_TOKEN_TIMEOUT_MS)
+        const timeoutMs = Number.isFinite(rawTimeout) && rawTimeout > 0 ? rawTimeout : 120_000
+        const timeout = new AbortController()
+        const signal = AbortSignal.any([timeout.signal, ...(init.signal ? [init.signal] : [])])
+        const timer = setTimeout(() => timeout.abort(), timeoutMs)
+        let response: Response
+        try {
+          response = await waitForAbort(
+            fetcher.call(this, url, { ...init, signal, body: JSON.stringify(body) }),
+            signal,
+          )
+        } catch (error) {
+          if (timeout.signal.aborted && !init.signal?.aborted)
+            throw new LlmError("Loomy 等待上游响应头超时，切换账号重试", "TIMEOUT", { status: 504 })
+          throw error
+        } finally {
+          clearTimeout(timer)
+        }
         let kind = "other"
         if (!response.ok) kind = native.classify(await response.clone().text(), response.status)
         else if (response.headers.get("content-type")?.toLowerCase().includes("application/json")) {

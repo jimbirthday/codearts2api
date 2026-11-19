@@ -34,21 +34,17 @@ async function setup(t: any, count = 2, config: Record<string, string> = {}, cat
   )
   const catalogCalls: string[] = []
   const native = await loadLoomyScheduling()
-  const balances = new Map(batch.payload.accounts.map((account) => [account.id, { daily: 100, permanent: 1000 }]))
-  vi.spyOn(native.balanceCache(), "readStale").mockImplementation(async (_provider: string, id: string) => {
-    const balance = balances.get(id)
-    return {
+  const setBalance = (id: string, balance: { daily: number; permanent: number }) =>
+    native.balanceCache().write("loomy", id, {
       at: Date.now(),
-      value: balance
-        ? {
-            packages: [
-              { name: "每日赠送", remaining: balance.daily },
-              { name: "永久积分", remaining: balance.permanent },
-            ],
-          }
-        : undefined,
-    }
-  })
+      value: {
+        packages: [
+          { name: "每日赠送", remaining: balance.daily },
+          { name: "永久积分", remaining: balance.permanent },
+        ],
+      },
+    })
+  for (const account of batch.payload.accounts) setBalance(account.id, { daily: 100, permanent: 1000 })
   const calls: Array<{ account: string; cacheKey: string; model: string; effort?: string }> = []
   let answer = async (_url: string, _init: any): Promise<Response> => completion()
   adapter.fetchImpl = (url: string, init: any) => {
@@ -104,7 +100,8 @@ async function setup(t: any, count = 2, config: Record<string, string> = {}, cat
     calls,
     send,
     batch,
-    balances,
+    setBalance,
+    clearBalances: () => native.balanceCache().clear("loomy"),
     availableModels,
     catalogCalls,
     direct: `http://${status.address.host}:${status.address.port}`,
@@ -283,23 +280,23 @@ test("Loomy 模型限流可尝试全池，全部冷却不再打上游也不假�
   assert.equal(env.calls.length, 6)
 })
 
-test("Loomy 永久积分锁定、余额未知失败关闭；严格手动顺序优先于余额档位", async (t) => {
+test("Loomy 不按积分档位排序；永久积分锁定、余额未知失败关闭与手动顺序仍生效", async (t) => {
   const env = await setup(t)
   const [first, second] = env.batch.payload.accounts
-  env.balances.set(first.id, { daily: 0, permanent: 1000 })
-  let response = await env.send("daily-first")
+  env.setBalance(first.id, { daily: 0, permanent: 1000 })
+  let response = await env.send("no-daily-priority")
   assert.equal(response.status, 200, JSON.stringify(await response.json()))
-  assert.equal(env.calls[0].account, loomyLine(2).split("----")[1])
+  assert.equal(env.calls[0].account, loomyLine(1).split("----")[1])
   vi.spyOn(env.pool, "strictManualOrder").mockReturnValue(true)
   response = await env.send("manual-first")
   assert.equal(response.status, 200, JSON.stringify(await response.json()))
   assert.equal(env.calls[1].account, loomyLine(1).split("----")[1])
   vi.spyOn(env.pool, "permanentLocked").mockReturnValue(true)
-  env.balances.set(second.id, { daily: 0, permanent: 1000 })
+  env.setBalance(second.id, { daily: 0, permanent: 1000 })
   response = await env.send("locked")
   assert.notEqual(response.status, 200, JSON.stringify(await response.json()))
   assert.equal(env.calls.length, 2)
-  env.balances.clear()
+  env.clearBalances()
   response = await env.send("unknown")
   assert.notEqual(response.status, 200, JSON.stringify(await response.json()))
   assert.equal(env.calls.length, 2)
@@ -383,22 +380,18 @@ test("Loomy 满载时会话等待与队列取消不占用额外上游名额", as
   await vi.waitFor(() => assert.equal(env.app.host.loomyScheduling.stats().inFlight, 0))
 })
 
-test("Loomy 冷余额查询可取消，不会等余额端点返回后才释放请求", async (t) => {
+test("Loomy 请求只读后台缓存，冷余额也不调用查询接口", async (t) => {
   const env = await setup(t)
+  env.clearBalances()
   const native = await loadLoomyScheduling()
-  let reads = 0
-  ;(native.balanceCache().readStale as any).mockImplementation(() => {
-    reads++
-    return new Promise(() => {})
-  })
-  const abort = new AbortController()
-  const waiting = env.send("cold", { signal: abort.signal })
-  const rejected = assert.rejects(waiting, (error: any) => error.name === "AbortError")
-  await vi.waitFor(() => assert.ok(reads > 0))
-  abort.abort()
-  await rejected
-  assert.equal(env.calls.length, 0)
-  assert.equal(env.app.host.loomyScheduling.stats().inFlight, 0)
+  const spies = ["readStale", "readOne", "refreshOne"].map((name) =>
+    vi.spyOn(native.balanceCache(), name).mockImplementation(() => {
+      throw new Error("请求路径不能查询余额")
+    }),
+  )
+  const response = await env.send("cold-balance", { signal: AbortSignal.timeout(2000) })
+  assert.equal(response.status, 200, JSON.stringify(await response.json()))
+  assert.ok(spies.every((spy) => spy.mock.calls.length === 0))
 })
 
 test("Loomy 冷却批量解除仅作用于指定渠道与模型，受管理鉴权保护", async (t) => {
@@ -588,4 +581,143 @@ test("Loomy 目录并发读取合并网络请求，刷新不清空在途可用�
   entries = []
   await catalog.load()
   assert.equal(catalog.modelFor("fixture-account", MODEL), undefined)
+})
+
+test("Loomy 大账号池目录总等待不按批次累加，慢账号不吞掉已取得的健康目录", async () => {
+  const native = await loadLoomyScheduling()
+  vi.useFakeTimers()
+  try {
+    const entries = Array.from({ length: 12 }, (_, i) => ({ id: `fixture-${i}` }))
+    const catalog = createLoomyModels({
+      native,
+      adapter: { product: { apiBase: "https://fixture.invalid" } },
+      pool: {
+        candidateAccounts: () => entries,
+        resolveFirstCredential: async (_provider: string, [entry]: any[]) => ({
+          entry,
+          credential: { access_token: entry.id },
+        }),
+      },
+      fetcher: (_url: string, init: any) =>
+        new Headers(init.headers).get("token") === "fixture-0"
+          ? Promise.resolve(new Response(JSON.stringify({ data: [{ id: MODEL, type: "chat" }] })))
+          : new Promise((_resolve, reject) =>
+              init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }),
+            ),
+    })
+    let result: any[] | undefined
+    const loading = catalog.load().then((models: any[]) => {
+      result = models
+    })
+    await vi.advanceTimersByTimeAsync(10_001)
+    assert.ok(result, "一次目录加载必须在统一 10 秒预算内结束，不能逐批再等 10 秒")
+    assert.equal(result[0].id, MODEL)
+    await loading
+  } finally {
+    vi.useRealTimers()
+  }
+})
+
+test("Loomy 余额端点挂起不影响请求，后台写入的新余额会直接影响选号", async (t) => {
+  const env = await setup(t)
+  const native = await loadLoomyScheduling()
+  const blocked = vi.spyOn(native.balanceCache(), "readStale").mockImplementation(() => new Promise(() => {}))
+  const first = await env.send("background-only", { signal: AbortSignal.timeout(2000) })
+  assert.equal(first.status, 200, JSON.stringify(await first.json()))
+  env.setBalance(env.batch.payload.accounts[0].id, { daily: 0, permanent: 0 })
+  const second = await env.send("background-only", { signal: AbortSignal.timeout(2000) })
+  assert.equal(second.status, 200, JSON.stringify(await second.json()))
+  assert.notEqual(env.calls[0].account, env.calls[1].account)
+  assert.equal(blocked.mock.calls.length, 0)
+})
+
+test("Loomy 后台余额未知且永久积分锁定立即返回 503，不等待或消耗永久积分", async (t) => {
+  const env = await setup(t)
+  env.clearBalances()
+  vi.spyOn(env.pool, "permanentLocked").mockReturnValue(true)
+  const response = await env.send("unknown-background", { signal: AbortSignal.timeout(2000) })
+  assert.equal(response.status, 503, JSON.stringify(await response.json()))
+  assert.equal(env.calls.length, 0)
+  assert.equal(env.app.host.loomyScheduling.stats().inFlight, 0)
+})
+
+for (const all of [false, true]) {
+  test(`Loomy 等响应头超时${all ? "全部账号失败返回 504" : "自动换号成功"}，不永久占用名额`, async (t) => {
+    const env = await setup(t, 2, { DSH_LOOMY_FIRST_TOKEN_TIMEOUT_MS: "60" })
+    const signals: AbortSignal[] = []
+    env.setAnswer(async (_url, init) => {
+      signals.push(init.signal)
+      return all || env.calls.length === 1 ? new Promise(() => {}) : completion()
+    })
+    const response = await env.send("headers-hung", { signal: AbortSignal.timeout(2000) })
+    assert.equal(response.status, all ? 504 : 200, JSON.stringify(await response.json()))
+    assert.equal(env.calls.length, 2)
+    assert.ok(signals[0].aborted)
+    assert.equal(env.app.host.loomyScheduling.stats().inFlight, 0)
+  })
+}
+
+test("Loomy 收到响应头后取消响应头计时，长流不会被首字预算中途终止", async (t) => {
+  const env = await setup(t, 2, { DSH_LOOMY_FIRST_TOKEN_TIMEOUT_MS: "60" })
+  let finish!: () => void, signal!: AbortSignal
+  env.setAnswer(async (_url, init) => {
+    signal = init.signal
+    return new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode(delta("HELLO")))
+          finish = () => {
+            controller.enqueue(encoder.encode(end))
+            controller.close()
+          }
+        },
+      }),
+      { headers: { "content-type": "text/event-stream" } },
+    )
+  })
+  const response = await env.send("long-after-headers", { stream: true })
+  const reader = response.body!.getReader()
+  await reader.read()
+  await new Promise((resolve) => setTimeout(resolve, 100))
+  assert.equal(signal.aborted, false)
+  finish()
+  while (!(await reader.read()).done) {
+    /* 排空 SSE。 */
+  }
+  assert.equal(env.calls.length, 1)
+})
+
+test("Loomy 后台积分更新后，队列自动使用新可用账号，无需等待其他账号长流结束", async (t) => {
+  const env = await setup(t, 2, { LOOMY_MAX_IN_FLIGHT: "1" })
+  env.setBalance(env.batch.payload.accounts[1].id, { daily: 0, permanent: 0 })
+  let finish!: () => void
+  env.setAnswer(async () =>
+    env.calls.length > 1
+      ? completion()
+      : new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(encoder.encode(delta("HELLO")))
+              finish = () => {
+                controller.enqueue(encoder.encode(end))
+                controller.close()
+              }
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        ),
+  )
+  const first = await env.send("first-balance", { stream: true })
+  const reader = first.body!.getReader()
+  await reader.read()
+  const waiting = env.send("later-balance", { signal: AbortSignal.timeout(3000) })
+  await vi.waitFor(() => assert.equal(env.app.host.loomyScheduling.stats().queued, 1))
+  env.setBalance(env.batch.payload.accounts[1].id, { daily: 100, permanent: 1000 })
+  const second = await waiting
+  assert.equal(second.status, 200, JSON.stringify(await second.json()))
+  assert.notEqual(env.calls[0].account, env.calls[1].account)
+  finish()
+  while (!(await reader.read()).done) {
+    /* 排空 SSE。 */
+  }
 })
