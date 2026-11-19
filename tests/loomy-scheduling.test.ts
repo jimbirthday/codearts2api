@@ -1,7 +1,9 @@
 import assert from "node:assert/strict"
+import { credentialRef } from "@deepseek-ai/dsh-credentials"
 import { test, vi } from "vite-plus/test"
 import { resolveLoomyScheduling } from "../src/config/env.ts"
 import { loadLoomyScheduling } from "../src/core/upstream.ts"
+import { createLoomyModels } from "../src/host/loomy-models.ts"
 import { prepareLoomyImport } from "../web/utils/loomy-import"
 import { loomyFile, loomyLine } from "./fixtures/loomy-import"
 import { rpc, startTestApp } from "./helpers"
@@ -13,7 +15,7 @@ const delta = (content: string) =>
 const end = `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 5, completion_tokens: 2, prompt_tokens_details: { cached_tokens: 3 } } })}\n\ndata: [DONE]\n\n`
 const completion = () => new Response(delta("OK") + end, { headers: { "content-type": "text/event-stream" } })
 
-async function setup(t: any, count = 2, config: Record<string, string> = {}) {
+async function setup(t: any, count = 2, config: Record<string, string> = {}, catalogs?: string[][]) {
   for (const [name, value] of Object.entries({ DSH_JET_HUB_AUTO_CHECKIN_DELAY_MS: "3600000", ...config }))
     vi.stubEnv(name, value)
   const app = await startTestApp()
@@ -25,10 +27,12 @@ async function setup(t: any, count = 2, config: Record<string, string> = {}) {
   const batch = await prepareLoomyImport([
     loomyFile(Array.from({ length: count }, (_, i) => loomyLine(i + 1)).join("\n")),
   ])
-  assert.equal((await rpc(app.origin, "backup.import", { payload: batch.payload, mode: "merge" })).ok, true)
   const adapter = app.host.ctx.get("llm").adapters.get("loomy").adapter
   const pool = app.host.ctx.get("accountPool")
-  adapter.options.fetchRemoteModels = async () => [{ id: MODEL, name: "Test", contextWindow: 131072 }]
+  const availableModels = new Map(
+    batch.payload.accounts.map((_account, i) => [loomyLine(i + 1).split("----")[1], catalogs?.[i] ?? [MODEL]]),
+  )
+  const catalogCalls: string[] = []
   const native = await loadLoomyScheduling()
   const balances = new Map(batch.payload.accounts.map((account) => [account.id, { daily: 100, permanent: 1000 }]))
   vi.spyOn(native.balanceCache(), "readStale").mockImplementation(async (_provider: string, id: string) => {
@@ -45,16 +49,40 @@ async function setup(t: any, count = 2, config: Record<string, string> = {}) {
         : undefined,
     }
   })
-  const status = (await rpc(app.origin, "gateway.getEnabled")).value
-  const calls: Array<{ account: string; cacheKey: string }> = []
+  const calls: Array<{ account: string; cacheKey: string; model: string; effort?: string }> = []
   let answer = async (_url: string, _init: any): Promise<Response> => completion()
   adapter.fetchImpl = (url: string, init: any) => {
     const token = new Headers(init.headers).get("token")!
     assert.ok(token)
+    if (url.endsWith("/models")) {
+      catalogCalls.push(token)
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            object: "list",
+            data: (availableModels.get(token) ?? []).map((id) => ({
+              id,
+              name: id,
+              type: "chat",
+              context_length: 131072,
+              reasoning_efforts: ["none", "low", "high"],
+            })),
+          }),
+          { headers: { "content-type": "application/json" } },
+        ),
+      )
+    }
     assert.equal(new Headers(init.headers).get("authorization"), `Bearer ${token}`)
-    calls.push({ account: token, cacheKey: JSON.parse(init.body).prompt_cache_key })
+    calls.push({
+      account: token,
+      cacheKey: JSON.parse(init.body).prompt_cache_key,
+      model: JSON.parse(init.body).model,
+      effort: JSON.parse(init.body).reasoning_effort,
+    })
     return answer(url, init)
   }
+  assert.equal((await rpc(app.origin, "backup.import", { payload: batch.payload, mode: "merge" })).ok, true)
+  const status = (await rpc(app.origin, "gateway.getEnabled")).value
   const send = (session: string, extra: any = {}, origin = app.origin, path = "/v1/chat/completions") => {
     const { signal, ...payload } = extra
     return fetch(origin + path, {
@@ -77,6 +105,8 @@ async function setup(t: any, count = 2, config: Record<string, string> = {}) {
     send,
     batch,
     balances,
+    availableModels,
+    catalogCalls,
     direct: `http://${status.address.host}:${status.address.port}`,
     setAnswer(fn: typeof answer) {
       answer = fn
@@ -408,4 +438,154 @@ test("聚合到 Loomy 也经过同一调度，会话绑定与直连共享", asyn
   const direct = await env.send("shared")
   assert.equal(direct.status, 200, JSON.stringify(await direct.json()))
   assert.deepEqual(env.calls[0], env.calls[1])
+})
+
+test("Loomy 混合权限池聚合模型，大小写别名只派发支持账号并发送准确 ID", async (t) => {
+  const env = await setup(t, 3, {}, [["spark-x2.6-low"], [MODEL], [MODEL, "GLM-5.3-Flash"]])
+  const models = await (
+    await fetch(env.app.origin + "/v1/models", {
+      headers: { authorization: `Bearer ${(await rpc(env.app.origin, "gateway.getEnabled")).value.apiKey.value}` },
+    })
+  ).json()
+  const ids = models.data.map((model: any) => model.id)
+  assert.ok(ids.includes(`loomy/${MODEL}`))
+  assert.ok(ids.includes("loomy/GLM-5.3-Flash"))
+  for (const session of ["alias-one", "alias-two", "alias-one"]) {
+    const response = await env.send(session, { model: "loomy/deepseek-v4.1-flash", reasoning_effort: "none" })
+    assert.equal(response.status, 200, JSON.stringify(await response.json()))
+  }
+  assert.ok(env.calls.every((call) => call.account !== loomyLine(1).split("----")[1]))
+  assert.ok(env.calls.every((call) => call.model === MODEL && call.effort === "none"))
+  assert.deepEqual(env.calls[0], env.calls[2])
+  assert.notEqual(env.calls[0].account, env.calls[1].account)
+})
+
+for (const unknown of [false, true]) {
+  test(`Loomy ${unknown ? "目录未知返回 503" : "全部不支持返回 404"}，不发送聊天请求或猜测 Spark`, async (t) => {
+    const env = await setup(t, 2, {}, unknown ? [[], []] : [["spark-x2.6-low"], ["spark-x2.6-4b"]])
+    const response = await env.send("unsupported", { model: "loomy/deepseek-v4.1-flash" })
+    assert.equal(response.status, unknown ? 503 : 404, JSON.stringify(await response.json()))
+    assert.equal(env.calls.length, 0)
+  })
+}
+
+test("Loomy 模型目录热请求复用缓存，手动刷新与凭据替换读取新权限", async (t) => {
+  const env = await setup(t)
+  const before = env.catalogCalls.length
+  await Promise.all(
+    Array.from({ length: 6 }, async (_, i) => {
+      const response = await env.send(`cached-${i}`)
+      assert.equal(response.status, 200, JSON.stringify(await response.json()))
+    }),
+  )
+  assert.equal(env.catalogCalls.length, before)
+  await env.adapter.refresh()
+  assert.equal(env.catalogCalls.length, before + 2)
+  const account = env.batch.payload.accounts[0]
+  const stored = JSON.parse(env.batch.payload.credentials[account.credentialRef])
+  const replacement = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  env.availableModels.set(replacement, ["spark-x2.6-low"])
+  await env.app.host.ctx.get("credentials").set(
+    credentialRef(account.credentialRef),
+    JSON.stringify({
+      ...stored,
+      access_token: replacement,
+    }),
+  )
+  const response = await env.send("changed-token")
+  assert.equal(response.status, 200, JSON.stringify(await response.json()))
+  assert.equal(env.calls.at(-1)!.account, loomyLine(2).split("----")[1])
+  assert.equal(env.catalogCalls.length, before + 3)
+})
+
+test("Loomy 大小写共用模型冷却，其他 Spark 账号空闲时仍正确返回 429", async (t) => {
+  const env = await setup(t, 2, {}, [[MODEL], ["spark-x2.6-low"]])
+  env.setAnswer(async () => new Response("rate limit", { status: 429 }))
+  let response = await env.send("lower", { model: "loomy/deepseek-v4.1-flash" })
+  assert.equal(response.status, 429, JSON.stringify(await response.json()))
+  const limits = env.pool.findAccount(env.batch.payload.accounts[0].id).modelRateLimits
+  assert.ok(limits[MODEL] > Date.now())
+  assert.equal(limits[MODEL.toLowerCase()], undefined)
+  response = await env.send("exact")
+  assert.equal(response.status, 429, JSON.stringify(await response.json()))
+  assert.equal(env.calls.length, 1)
+  await env.pool.clearModelRateLimits(env.batch.payload.accounts[0].id, [MODEL])
+  await env.pool.updateModelRateLimit(env.batch.payload.accounts[0].id, MODEL.toLowerCase(), Date.now() + 60000)
+  response = await env.send("old-alias")
+  assert.equal(response.status, 429, JSON.stringify(await response.json()))
+  assert.equal(env.calls.length, 1)
+})
+
+test("Loomy 代理逐段输出推理和正文，完整响应结束前客户端均已收到", async (t) => {
+  const env = await setup(t)
+  let pushText!: () => void, finish!: () => void
+  env.setAnswer(
+    async () =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"reasoning_content":"THINK"}}]}\n\n'))
+            pushText = () => controller.enqueue(encoder.encode(delta("TEXT")))
+            finish = () => {
+              controller.enqueue(encoder.encode(end))
+              controller.close()
+            }
+          },
+        }),
+        { headers: { "content-type": "text/event-stream" } },
+      ),
+  )
+  const response = await env.send("chunks", { stream: true })
+  const reader = response.body!.getReader(),
+    decoder = new TextDecoder()
+  let received = ""
+  while (!received.includes("THINK")) received += decoder.decode((await reader.read()).value)
+  assert.equal(env.app.host.loomyScheduling.stats().inFlight, 1)
+  pushText()
+  while (!received.includes("TEXT")) received += decoder.decode((await reader.read()).value)
+  assert.equal(env.app.host.loomyScheduling.stats().inFlight, 1)
+  finish()
+  while (!(await reader.read()).done) {
+    /* 排空 SSE。 */
+  }
+  await vi.waitFor(() => assert.equal(env.app.host.loomyScheduling.stats().inFlight, 0))
+})
+
+test("Loomy 目录并发读取合并网络请求，刷新不清空在途可用映射，删除账号移除旧权限", async () => {
+  const native = await loadLoomyScheduling()
+  let entries = [{ id: "fixture-account" }],
+    release!: (value: Response) => void,
+    requests = 0
+  const catalog = createLoomyModels({
+    native,
+    adapter: { product: { apiBase: "https://fixture.invalid" } },
+    pool: {
+      candidateAccounts: () => entries,
+      resolveFirstCredential: async (_provider: string, [entry]: any[]) => ({
+        entry,
+        credential: { access_token: "fixture-token" },
+      }),
+    },
+    fetcher: () => {
+      requests++
+      return new Promise<Response>((resolve) => {
+        release = resolve
+      })
+    },
+  })
+  const response = () => new Response(JSON.stringify({ data: [{ id: MODEL, type: "chat" }] }))
+  const reads = [catalog.load(), catalog.load()]
+  await vi.waitFor(() => assert.equal(requests, 1))
+  release(response())
+  await Promise.all(reads)
+  assert.equal(catalog.modelFor("fixture-account", MODEL.toLowerCase()).id, MODEL)
+  catalog.clear()
+  const refreshed = catalog.load()
+  await vi.waitFor(() => assert.equal(requests, 2))
+  assert.equal(catalog.modelFor("fixture-account", MODEL).id, MODEL)
+  release(response())
+  await refreshed
+  entries = []
+  await catalog.load()
+  assert.equal(catalog.modelFor("fixture-account", MODEL), undefined)
 })

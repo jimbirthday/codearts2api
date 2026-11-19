@@ -8,9 +8,10 @@ import { clearModelCooldowns } from "../modules/scheduling/model-cooldowns.ts"
 import type { ChannelSchedulingConfig } from "../modules/scheduling/scheduling-settings.service.ts"
 import type { GatewayContext } from "./gateway-context.ts"
 import { acquireScheduledAccount, wrapScheduledAdapter } from "./scheduled-adapter.ts"
+import { createLoomyModels } from "./loomy-models.ts"
 
-async function readBalances(readings: Promise<any>[], signal?: AbortSignal) {
-  if (!signal) return Promise.all(readings)
+async function waitForAbort<T>(work: Promise<T>, signal?: AbortSignal) {
+  if (!signal) return work
   signal.throwIfAborted()
   let abort!: () => void
   const cancelled = new Promise<never>((_resolve, reject) => {
@@ -18,7 +19,7 @@ async function readBalances(readings: Promise<any>[], signal?: AbortSignal) {
     signal.addEventListener("abort", abort, { once: true })
   })
   try {
-    return await Promise.race([Promise.all(readings), cancelled])
+    return await Promise.race([work, cancelled])
   } finally {
     signal.removeEventListener("abort", abort)
   }
@@ -40,16 +41,38 @@ export async function installLoomyScheduling(
     if (!providers.includes("loomy")) return register.call(this, providers, adapter)
     assertLoomySchedulingContract(adapter)
     pool = adapter.options.accountPool
+    const catalog = createLoomyModels({ native, pool, adapter, fetcher: (url: any, init: any) => fetchImpl(url, init) })
+    adapter.options.fetchRemoteModels = () => {
+      catalog.clear()
+      return catalog.load()
+    }
     const balances = new Map<string, any>()
     const manualOrder = new Map<string, number>()
-    const baseCandidates = (model: string, excluded: Set<string>) => pool.candidateAccounts("loomy", model, excluded)
+    const cooling = (entry: any, model: string) =>
+      Object.entries(entry.modelRateLimits ?? {}).some(
+        ([id, until]: any) => native.catalogKey(id) === native.catalogKey(model) && until > Date.now(),
+      )
+    const baseCandidates = (model: string, excluded: Set<string>) =>
+      pool.candidateAccounts("loomy", "", excluded).filter((entry: any) => !model || !cooling(entry, model))
     const candidates = (model: string, excluded: Set<string>) => {
-      const available = baseCandidates(model, excluded)
+      const entries = baseCandidates(model, excluded)
+      const available = entries.filter((entry: any) => catalog.modelFor(entry.id, model))
       if (
         !available.length &&
-        pool.candidateAccounts("loomy", "", excluded).some((entry: any) => entry.modelRateLimits?.[model] > Date.now())
+        pool
+          .candidateAccounts("loomy", "", new Set())
+          .some((entry: any) => catalog.modelFor(entry.id, model) && cooling(entry, model))
       )
         throw new LlmError("Loomy 当前模型的账号均在冷却中，请稍后重试", "RATE_LIMIT", { status: 429 })
+      if (!available.length && [...excluded].some((id) => catalog.modelFor(id, model))) return []
+      if (entries.length && !available.length) {
+        const unknown = entries.some((entry: any) => !catalog.known(entry.id))
+        throw new LlmError(
+          unknown ? "Loomy 账号模型权限暂时无法确认，请稍后重试" : `Loomy 模型不存在或当前账号均不支持：${model}`,
+          unknown ? "TRANSPORT" : "INVALID_REQUEST",
+          { status: unknown ? 503 : 404 },
+        )
+      }
       const options = { allowPermanent: !pool.permanentLocked("loomy") }
       const ranked = available.map((entry: any) => ({
         entry,
@@ -81,26 +104,31 @@ export async function installLoomyScheduling(
       const state = dispatch.getStore()
       if (!state) return resolve(...args)
       if (!state.balancesReady) {
-        const entries = baseCandidates(state.model, state.excluded)
-        const readings = await readBalances(
-          entries.map(async (entry: any) => {
-            const account = await pool.resolveFirstCredential("loomy", [entry])
-            if (!account) return [entry.id, { ok: false }]
-            const cache = native.balanceCache()
-            if (cache) {
-              const reading = await cache.readStale("loomy", entry.id, { credential: account.credential })
-              const packages = reading.value?.packages ?? []
-              // CreditBalance 的两池名称是上游注册表契约，余额值与缓存新鲜度由上游维护。
-              const dailyBalance = packages.find((pkg: any) => pkg.name.includes("每日"))?.remaining
-              const permanentBalance = packages.find((pkg: any) => pkg.name.includes("永久"))?.remaining
-              return [
-                entry.id,
-                { ok: dailyBalance !== undefined || permanentBalance !== undefined, dailyBalance, permanentBalance },
-              ]
-            }
-            const balance = await native.fetchBalance(account.credential, adapter.product, adapter.fetchImpl)
-            return [entry.id, { ok: !!balance, dailyBalance: balance?.daily, permanentBalance: balance?.permanent }]
-          }),
+        await waitForAbort(catalog.load(), state.signal)
+        const entries = baseCandidates(state.model, state.excluded).filter((entry: any) =>
+          catalog.modelFor(entry.id, state.model),
+        )
+        const readings = await waitForAbort(
+          Promise.all(
+            entries.map(async (entry: any) => {
+              const account = await pool.resolveFirstCredential("loomy", [entry])
+              if (!account) return [entry.id, { ok: false }]
+              const cache = native.balanceCache()
+              if (cache) {
+                const reading = await cache.readStale("loomy", entry.id, { credential: account.credential })
+                const packages = reading.value?.packages ?? []
+                // CreditBalance 的两池名称是上游注册表契约，余额值与缓存新鲜度由上游维护。
+                const dailyBalance = packages.find((pkg: any) => pkg.name.includes("每日"))?.remaining
+                const permanentBalance = packages.find((pkg: any) => pkg.name.includes("永久"))?.remaining
+                return [
+                  entry.id,
+                  { ok: dailyBalance !== undefined || permanentBalance !== undefined, dailyBalance, permanentBalance },
+                ]
+              }
+              const balance = await native.fetchBalance(account.credential, adapter.product, adapter.fetchImpl)
+              return [entry.id, { ok: !!balance, dailyBalance: balance?.daily, permanentBalance: balance?.permanent }]
+            }),
+          ),
           state.signal,
         )
         for (const [id, balance] of readings) balances.set(id, balance)
@@ -121,13 +149,10 @@ export async function installLoomyScheduling(
     const markFailure = async (kind: string, state: any) => {
       if (!state.lease) return
       if (kind === "auth") scheduler.blockAccount(state.lease.entry.id)
-      if (
-        ["quota", "rate"].includes(kind) &&
-        !(pool.findAccount(state.lease.entry.id)?.modelRateLimits?.[state.model] > Date.now())
-      )
+      if (["quota", "rate"].includes(kind) && !cooling(pool.findAccount(state.lease.entry.id) ?? {}, state.model))
         await pool.updateModelRateLimit(
           state.lease.entry.id,
-          state.model,
+          catalog.modelFor(state.lease.entry.id, state.model)?.id ?? state.model,
           kind === "quota"
             ? native.quotaResetAt("quota")
             : Date.now() + randomInt(config.cooldownMinSeconds, config.cooldownMaxSeconds + 1) * 1000,
@@ -145,6 +170,10 @@ export async function installLoomyScheduling(
         const state = dispatch.getStore()
         if (!state || !String(url).endsWith("/chat/completions")) return fetcher.call(this, url, init)
         const body = JSON.parse(init.body)
+        const model = catalog.modelFor(state.lease?.entry.id, state.model)
+        if (!model)
+          throw new LlmError(`Loomy 模型不存在或当前账号不支持：${state.model}`, "INVALID_REQUEST", { status: 404 })
+        body.model = model.id
         body.prompt_cache_key = createHash("sha256")
           .update(`loomy\0${state.sessionKey ?? state.requestId}\0${state.lease?.entry.id ?? ""}`)
           .digest("hex")

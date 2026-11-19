@@ -62,12 +62,15 @@ export async function loadSchedulingLedger(): Promise<(provider: string, account
 /** Loomy 的协议、余额与失败分类继续复用锁定版本的上游模块。 */
 export async function loadLoomyScheduling() {
   const base = import.meta.resolve("dsh-providers-hub")
-  const [adapter, credits, ranks, runtime, protocol] = await Promise.all([
+  const [adapter, credits, ranks, runtime, protocol, catalog, cache, product] = await Promise.all([
     import(new URL("./loomy-adapter.js", base).href),
     import(new URL("./loomy-credits.js", base).href),
     import(new URL("./loomy-balance-rank.js", base).href),
     import(new URL("./provider-runtime.js", base).href),
     import(new URL("./loomy.js", base).href),
+    import(new URL("./model-catalog.js", base).href),
+    import(new URL("./ttl-cache.js", base).href),
+    import(new URL("./loomy-product.js", base).href),
   ])
   const result = {
     classify: adapter.classifyLoomyFailure,
@@ -77,10 +80,16 @@ export async function loadLoomyScheduling() {
     tierUsable: ranks.loomyTierUsable,
     balanceCache: runtime.balanceCacheOf,
     envelope: protocol.parseLoomyEnvelope,
+    parseModels: adapter.parseLoomyRemoteModels,
+    businessHeaders: protocol.loomyBusinessHeaders,
+    catalogKey: product.loomyCatalogKey,
+    TtlCache: cache.TtlCache,
   }
   if (Object.values(result).some((value) => typeof value !== "function"))
     throw new Error("Loomy 调度契约已变化，请核对 src/core/upstream.ts")
-  return result
+  if (!Number.isFinite(catalog.CATALOG_REFRESH_INTERVAL_MS) || catalog.CATALOG_REFRESH_INTERVAL_MS <= 0)
+    throw new Error("Loomy 模型目录缓存契约已变化，请核对 src/core/upstream.ts")
+  return { ...result, catalogTtlMs: catalog.CATALOG_REFRESH_INTERVAL_MS }
 }
 
 export function assertLoomySchedulingContract(adapter: any) {
