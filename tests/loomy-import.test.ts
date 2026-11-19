@@ -1,7 +1,9 @@
 import assert from "node:assert/strict"
 import { stat } from "node:fs/promises"
+import { credentialRef } from "@deepseek-ai/dsh-credentials"
 import { test } from "vite-plus/test"
 
+import { exportLoomyAccounts } from "../web/utils/loomy-export"
 import { prepareLoomyImport } from "../web/utils/loomy-import"
 import { loomyFile, loomyLine } from "./fixtures/loomy-import"
 import { rpc, startTestApp } from "./helpers"
@@ -81,6 +83,16 @@ test("Loomy TXT 经真实 RPC 追加与重启：凭据不丢、不覆盖既有�
   const repeated = await rpc(app.origin, "backup.import", { payload: batch.payload, mode: "merge" })
   assert.equal(repeated.value.accountsImported, 0)
   assert.equal(repeated.value.accountsSkipped.length, 2)
+  const account = batch.payload.accounts[0]
+  const credential = JSON.parse(after.credentials[account.credentialRef])
+  credential.access_token = "b".repeat(32)
+  await app.host.ctx.get("credentials").set(credentialRef(account.credentialRef), JSON.stringify(credential))
+  const selected = await rpc(app.origin, "backup.export", { accountIds: [account.id] })
+  const exported = exportLoomyAccounts(selected.value.payload)
+  assert.equal(exported.accounts.length, 1)
+  assert.equal(exported.accounts[0].split("----")[1], credential.access_token)
+  const roundtrip = await prepareLoomyImport([loomyFile(exported.accounts.join("\n"))])
+  assert.deepEqual(JSON.parse(roundtrip.payload.credentials[account.credentialRef]), credential)
   const unauthorized = await fetch(`${app.origin}/api/jet-hub`, {
     method: "POST",
     headers: { "content-type": "application/json" },

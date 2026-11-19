@@ -1,5 +1,15 @@
 import type { AccountImportBatch } from "./account-import"
 
+/** TXT 导入、导出共用字段校验，确保备份可重新导入。 */
+export function normalizeLoomyCredential(raw: any) {
+  const phone = typeof raw?.phone === "string" ? raw.phone.trim() : ""
+  const access_token = typeof raw?.access_token === "string" ? raw.access_token.trim() : ""
+  const userid = typeof raw?.userid === "string" ? raw.userid.trim() : ""
+  if (!/^1\d{10}$/.test(phone) || !/^[a-f\d]{32}$/i.test(access_token) || !/^\d{6,64}$/.test(userid))
+    throw new Error("格式需为 手机号----32位 session token----userid")
+  return { phone, access_token, userid }
+}
+
 /** 仅做格式转换；账号与凭据仍经上游 merge 导入。 */
 export async function prepareLoomyImport(files: File[]): Promise<AccountImportBatch> {
   if (files.length > 100 || files.reduce((sum, file) => sum + file.size, 0) > 2 * 1024 * 1024)
@@ -33,16 +43,15 @@ export async function prepareLoomyImport(files: File[]): Promise<AccountImportBa
         .trim()
         .split("----")
         .map((value) => value.trim())
-      const [phone, access_token, userid] = parts
-      if (
-        parts.length !== 3 ||
-        !/^1\d{10}$/.test(phone) ||
-        !/^[a-f\d]{32}$/i.test(access_token) ||
-        !/^\d{6,64}$/.test(userid)
-      ) {
+      let credential: ReturnType<typeof normalizeLoomyCredential>
+      try {
+        if (parts.length !== 3) throw new Error("列数错误")
+        credential = normalizeLoomyCredential({ phone: parts[0], access_token: parts[1], userid: parts[2] })
+      } catch {
         batch.rows.push({ source, status: "invalid", message: "格式需为 手机号----32位 session token----userid" })
         continue
       }
+      const { phone, access_token, userid } = credential
       const keys = [`user:${userid}`, `token:${access_token}`, `phone:${phone}`]
       if (keys.some((key) => seen.has(key))) {
         batch.rows.push({ source, status: "skipped", message: "同批次重复账号，保留首条" })

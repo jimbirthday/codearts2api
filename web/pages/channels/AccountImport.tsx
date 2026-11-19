@@ -3,6 +3,7 @@ import { useRef, useState } from "react"
 import { hostRpcCall } from "../../api/rpc"
 import { exportCodeArtsAccounts } from "../../utils/codearts-export"
 import { prepareCodeArtsImport } from "../../utils/codearts-import"
+import { exportLoomyAccounts } from "../../utils/loomy-export"
 import { prepareLoomyImport } from "../../utils/loomy-import"
 import type { AccountImportBatch } from "../../utils/account-import"
 import styles from "./CodeArtsImport.module.less"
@@ -14,7 +15,8 @@ export function AccountImport({
   provider?: "codearts" | "loomy"
   onImported: () => void
 }) {
-  const label = provider === "codearts" ? "CodeArts JSON" : "Loomy TXT"
+  const name = provider === "codearts" ? "CodeArts" : "Loomy"
+  const label = `${name} ${provider === "codearts" ? "JSON" : "TXT"}`
   const inputRef = useRef<HTMLInputElement>(null)
   const [batch, setBatch] = useState<AccountImportBatch | null>(null)
   const [busy, setBusy] = useState(false)
@@ -66,27 +68,34 @@ export function AccountImport({
     setNotice("")
     setError("")
     try {
-      const listed = await hostRpcCall("account.list", { provider: "codearts" })
+      const listed = await hostRpcCall("account.list", { provider })
       const accountIds = listed.accounts
-        .filter((account: any) => account.provider === "codearts")
+        .filter((account: any) => account.provider === provider)
         .map((account: any) => account.id)
       if (!accountIds.length) {
-        setError("没有可导出的 CodeArts 账号")
+        setError(`没有可导出的 ${name} 账号`)
         return
       }
       const result = await hostRpcCall("backup.export", { accountIds })
-      const { accounts, skipped } = exportCodeArtsAccounts(result.payload)
-      const blob = new Blob([JSON.stringify(accounts, null, 2)], { type: "application/json" })
+      const { accounts, skipped } = (provider === "codearts" ? exportCodeArtsAccounts : exportLoomyAccounts)(
+        result.payload,
+      )
+      const blob = new Blob(
+        [provider === "codearts" ? JSON.stringify(accounts, null, 2) : accounts.join("\n") + "\n"],
+        {
+          type: provider === "codearts" ? "application/json" : "text/plain;charset=utf-8",
+        },
+      )
       const url = URL.createObjectURL(blob)
       const link = document.createElement("a")
       link.href = url
-      link.download = `codearts-accounts-${new Date().toISOString().replace(/[:.]/g, "-")}.json`
+      link.download = `${provider}-accounts-${new Date().toISOString().replace(/[:.]/g, "-")}.${provider === "codearts" ? "json" : "txt"}`
       document.body.append(link)
       link.click()
       link.remove()
       setTimeout(() => URL.revokeObjectURL(url), 0)
       const missing =
-        accountIds.length - result.payload.accounts.filter((account: any) => account.provider === "codearts").length
+        accountIds.length - result.payload.accounts.filter((account: any) => account.provider === provider).length
       setNotice(
         `已导出 ${accounts.length} 个账号${skipped + missing ? `；${skipped + missing} 个账号凭据不可用或已删除，未导出` : ""}`,
       )
@@ -101,20 +110,14 @@ export function AccountImport({
   const count = batch?.payload.accounts.length ?? 0
   const rows = batch?.rows ?? []
   return (
-    <section
-      className={styles.importer}
-      aria-label={`${label} 导入${provider === "codearts" ? "与导出" : ""}`}
-      aria-busy={busy}
-    >
+    <section className={styles.importer} aria-label={`${label} 导入与导出`} aria-busy={busy}>
       <div className={styles.toolbar}>
         <button type="button" className="c2a-btn" disabled={busy} onClick={() => inputRef.current?.click()}>
           {busy && !exporting ? "处理中…" : `导入 ${label}`}
         </button>
-        {provider === "codearts" ? (
-          <button type="button" className="c2a-btn" disabled={busy} onClick={download}>
-            {exporting ? "导出中…" : "导出 CodeArts JSON"}
-          </button>
-        ) : null}
+        <button type="button" className="c2a-btn" disabled={busy} onClick={download}>
+          {exporting ? "导出中…" : `导出 ${label}`}
+        </button>
         <input
           ref={inputRef}
           type="file"
@@ -131,7 +134,7 @@ export function AccountImport({
         <span className={styles.hint}>
           {provider === "codearts"
             ? "导入支持单个或多个文件，每批最多 100 个文件 / 2 MB；导出包含当前账号密钥与续期材料。"
-            : "每行：手机号----session token----userid；支持多个 TXT 文件，每批最多 100 个 / 2 MB。"}
+            : "每行：手机号----session token----userid；支持多个 TXT 文件，每批最多 100 个 / 2 MB；导出为同格式 TXT。"}
         </span>
       </div>
       {batch ? (
